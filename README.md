@@ -16,24 +16,47 @@ A VS Code workspace that gives you a custom **GitHub Copilot agent** and **skill
 
 ---
 
-## 1. Clone & Open the Repo
+## 1. Create Your Own Repo from the Template
 
-**One click** — VS Code clones the repo and opens the correct root folder automatically:
+> **Do not push changes directly to `OAA_Agent`.** It is a shared template. Create your own copy first.
 
-[![Open in VS Code](https://img.shields.io/badge/Open%20in-VS%20Code-blue?logo=visualstudiocode)](https://vscode.dev/redirect?url=vscode://vscode.git/clone?url%3Dhttps://github.com/pvolu-vz/OAA_Agent.git)
+### Option A — GitHub UI (recommended)
 
-<details>
-<summary>Prefer the terminal?</summary>
+1. Go to <https://github.com/pvolu-vz/OAA_Agent>.
+2. Click **Use this template → Create a new repository**.
+3. Choose an owner and name (e.g. `oaa-workday-connector`), set visibility, then click **Create repository**.
+4. Clone your new repo and open it in VS Code:
 
 ```bash
-git clone https://github.com/pvolu-vz/OAA_Agent.git
-cd OAA_Agent
+git clone https://github.com/<your-org>/<your-repo-name>.git
+cd <your-repo-name>
 code .
 ```
 
-> **Important:** Open the **root folder** (`OAA_Agent/`), not a subfolder. VS Code only auto-discovers `.github/agents/` and `.github/skills/` when the workspace root contains them.
+### Option B — Terminal only
 
-</details>
+```bash
+# 1. Clone the template into a new directory
+git clone https://github.com/pvolu-vz/OAA_Agent.git <your-repo-name>
+cd <your-repo-name>
+
+# 2. Remove the original remote so you can't accidentally push back
+git remote remove origin
+
+# 3. Create a new empty repo on GitHub (via gh CLI or the web UI), then add it
+gh repo create <your-org>/<your-repo-name> --private --source=. --push
+# — or manually —
+git remote add origin https://github.com/<your-org>/<your-repo-name>.git
+git push -u origin main
+```
+
+### Open in VS Code (one click)
+
+If you already have the repo cloned, open it with:
+
+[![Open in VS Code](https://img.shields.io/badge/Open%20in-VS%20Code-blue?logo=visualstudiocode)](https://vscode.dev/redirect?url=vscode://vscode.git/clone?url%3Dhttps://github.com/pvolu-vz/OAA_Agent.git)
+
+> **Important:** Open the **root folder** of your repo, not a subfolder. VS Code only auto-discovers `.github/agents/` and `.github/skills/` when the workspace root contains them.
 
 ---
 
