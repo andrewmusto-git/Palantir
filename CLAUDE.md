@@ -22,9 +22,9 @@ This project has two defined agent workflows. When the user's request matches th
 
 Before generating any code, read all three reference files in full:
 
-1. `.github/skills/veza-oaa-integration/references/references.md` — Veza SDK docs, private reference repos, community connector examples, and the required `_setup_logging()` logging template
-2. `.github/skills/veza-oaa-integration/references/artifacts.md` — Complete specifications for all 5 artifacts: Python CLI contract, data adapter patterns by source type, Bash installer spec, requirements base deps, `.env.example` template, README 11-section structure
-3. `.github/skills/veza-oaa-integration/references/quality-checklist.md` — 13-item quality checklist and automated validation protocol
+1. `.github/agents/references/references.md` — Veza SDK docs, private reference repos, community connector examples, and the required `_setup_logging()` logging template
+2. `.github/agents/references/artifacts.md` — Complete specifications for all 5 artifacts: Python CLI contract, data adapter patterns by source type, Bash installer spec, requirements base deps, `.env.example` template, README 11-section structure
+3. `.github/agents/references/quality-checklist.md` — 13-item quality checklist and automated validation protocol
 
 Apply these references throughout Steps 1–3. Do not generate code without reading them first.
 
