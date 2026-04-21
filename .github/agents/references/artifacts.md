@@ -175,7 +175,7 @@ The installer must:
 
 Base dependencies always included:
 ```
-oaaclient>=3.0.0
+oaaclient>=1.1.16
 python-dotenv>=1.0.0
 requests>=2.31.0
 urllib3>=2.0.0
