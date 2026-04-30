@@ -411,16 +411,20 @@ def build_oaa_payload(
         oaa_group = group_lookup.get(group_id)
         if oaa_group is None:
             continue
+        # The SDK's add_group() calls str() on whatever is passed, which would
+        # produce "Local Group - {name} ({unique_id})" — not a valid Veza
+        # group reference. Pass the identifier string directly instead.
+        group_identifier = oaa_group.unique_id if oaa_group.unique_id else oaa_group.name
         if m_type == "USER":
             oaa_user = user_lookup.get(m_id)
             if oaa_user:
-                oaa_user.add_group(oaa_group)
+                oaa_user.add_group(group_identifier)
                 membership_count += 1
         elif m_type in ("GROUP", "TEAM"):
             # nested group — ensure the child group exists then add it as a member
             child_group = group_lookup.get(m_id)
             if child_group:
-                child_group.add_group(oaa_group)
+                child_group.add_group(group_identifier)
                 membership_count += 1
     log.info("Linked %d group memberships", membership_count)
 
