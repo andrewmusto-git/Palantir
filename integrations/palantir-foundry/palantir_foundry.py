@@ -13,7 +13,7 @@ import os
 import sys
 from datetime import datetime
 from logging.handlers import TimedRotatingFileHandler
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -68,6 +68,7 @@ class PalantirFoundryClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        self._filesystem_cache: Optional[Tuple[List, List, List]] = None
         self._test_connection()
 
     def _test_connection(self) -> None:
@@ -146,67 +147,161 @@ class PalantirFoundryClient:
 
         return results
 
-    def get_workspaces(self) -> List[Dict]:
-        """Fetch all workspaces from Palantir Foundry."""
-        log.info("Fetching workspaces...")
+    def _list_spaces(self) -> List[Dict]:
+        """Fetch all Spaces from the Palantir Foundry v2 Filesystem API."""
         try:
-            results = self.get_paginated_results(
-                "/api/foundry/workspaces/v1/workspaces", items_key="workspaces"
+            return self.get_paginated_results(
+                "/api/v2/filesystem/spaces", items_key="data"
             )
-            log.info("Retrieved %d workspaces", len(results))
-            return results
         except requests.RequestException:
-            log.error("Failed to fetch workspaces")
+            log.error("Failed to fetch spaces")
             return []
+
+    def get_folder_children(self, folder_rid: str) -> List[Dict]:
+        """List all direct children of a folder or space (v2 Filesystem API)."""
+        try:
+            return self.get_paginated_results(
+                f"/api/v2/filesystem/folders/{folder_rid}/children",
+                items_key="data",
+            )
+        except requests.RequestException as e:
+            log.debug("Could not list children of %s: %s", folder_rid, e)
+            return []
+
+    def _traverse_folder(
+        self,
+        folder_rid: str,
+        projects: List[Dict],
+        datasets: List[Dict],
+        resources: List[Dict],
+        depth: int = 0,
+        max_depth: int = 5,
+    ) -> None:
+        """Recursively traverse a folder collecting projects, datasets, and other resources."""
+        if depth > max_depth:
+            log.debug("Max traversal depth reached at %s", folder_rid)
+            return
+        for child in self.get_folder_children(folder_rid):
+            rid = child.get("rid", "")
+            rtype = child.get("type", "")
+            if child.get("trashStatus", "NOT_TRASHED") != "NOT_TRASHED":
+                continue
+            if rtype == "FOUNDRY_DATASET":
+                datasets.append(child)
+            elif rtype == "COMPASS_FOLDER":
+                # A resource is a Project if its rid equals its projectRid field
+                if rid and rid == child.get("projectRid"):
+                    projects.append(child)
+                # Recurse into both regular folders and projects
+                self._traverse_folder(
+                    rid, projects, datasets, resources, depth + 1, max_depth
+                )
+            elif rtype:
+                resources.append(child)
+
+    def _discover_filesystem(self) -> Tuple[List[Dict], List[Dict], List[Dict]]:
+        """Traverse all spaces once and return (projects, datasets, resources). Results are cached."""
+        if self._filesystem_cache is not None:
+            return self._filesystem_cache
+        spaces = self._list_spaces()
+        projects: List[Dict] = []
+        datasets: List[Dict] = []
+        resources: List[Dict] = []
+        for space in spaces:
+            space_rid = space.get("rid", "")
+            if space_rid:
+                self._traverse_folder(space_rid, projects, datasets, resources)
+        log.info(
+            "Filesystem traversal complete: %d projects, %d datasets, %d other resources",
+            len(projects), len(datasets), len(resources),
+        )
+        self._filesystem_cache = (projects, datasets, resources)
+        return self._filesystem_cache
+
+    def get_workspaces(self) -> List[Dict]:
+        """Fetch all Spaces (top-level containers) from Palantir Foundry."""
+        log.info("Fetching spaces...")
+        results = self._list_spaces()
+        log.info("Retrieved %d spaces", len(results))
+        return results
 
     def get_projects(self) -> List[Dict]:
-        """Fetch all projects from Palantir Foundry."""
+        """Fetch all Projects from the Palantir Foundry filesystem."""
         log.info("Fetching projects...")
-        try:
-            results = self.get_paginated_results(
-                "/api/foundry/projects/v1/projects", items_key="projects"
-            )
-            log.info("Retrieved %d projects", len(results))
-            return results
-        except requests.RequestException:
-            log.error("Failed to fetch projects")
-            return []
+        projects, _, _ = self._discover_filesystem()
+        log.info("Retrieved %d projects", len(projects))
+        return projects
 
     def get_datasets(self) -> List[Dict]:
-        """Fetch all datasets from Palantir Foundry."""
+        """Fetch all Datasets (type=FOUNDRY_DATASET) from the Palantir Foundry filesystem."""
         log.info("Fetching datasets...")
-        try:
-            results = self.get_paginated_results(
-                "/api/foundry/datasets/v1/datasets", items_key="datasets"
-            )
-            log.info("Retrieved %d datasets", len(results))
-            return results
-        except requests.RequestException:
-            log.error("Failed to fetch datasets")
-            return []
+        _, datasets, _ = self._discover_filesystem()
+        log.info("Retrieved %d datasets", len(datasets))
+        return datasets
 
     def get_resources(self) -> List[Dict]:
-        """Fetch all resources from Palantir Foundry."""
+        """Fetch all non-dataset, non-folder resources from the Palantir Foundry filesystem."""
         log.info("Fetching resources...")
-        try:
-            results = self.get_paginated_results(
-                "/api/foundry/resources/v1/resources", items_key="resources"
-            )
-            log.info("Retrieved %d resources", len(results))
-            return results
-        except requests.RequestException:
-            log.error("Failed to fetch resources")
-            return []
+        _, _, resources = self._discover_filesystem()
+        log.info("Retrieved %d resources", len(resources))
+        return resources
 
     def get_access_policies(self, resource_id: str) -> List[Dict]:
-        """Fetch access policies for a specific resource."""
+        """Fetch role grants for a resource via the v2 Filesystem API."""
         try:
-            endpoint = f"/api/foundry/resources/v1/resources/{resource_id}/access-policies"
-            data = self._make_request("GET", endpoint)
-            return data.get("policies", [])
+            return self.get_paginated_results(
+                f"/api/v2/filesystem/resources/{resource_id}/roles",
+                items_key="data",
+            )
         except requests.RequestException as e:
-            log.debug("No access policies for resource %s: %s", resource_id, e)
+            log.debug("No roles for resource %s: %s", resource_id, e)
             return []
+
+    def get_users(self) -> List[Dict]:
+        """Fetch all users from Palantir Foundry."""
+        log.info("Fetching users...")
+        try:
+            results = self.get_paginated_results(
+                "/api/v2/admin/users", items_key="data"
+            )
+            log.info("Retrieved %d users", len(results))
+            return results
+        except requests.RequestException:
+            log.error("Failed to fetch users")
+            return []
+
+    def get_groups(self) -> List[Dict]:
+        """Fetch all groups from Palantir Foundry."""
+        log.info("Fetching groups...")
+        try:
+            results = self.get_paginated_results(
+                "/api/v2/admin/groups", items_key="data"
+            )
+            log.info("Retrieved %d groups", len(results))
+            return results
+        except requests.RequestException:
+            log.error("Failed to fetch groups")
+            return []
+
+    def get_group_members(self, group_id: str) -> List[Dict]:
+        """Fetch all members (users and nested groups) of a specific group."""
+        try:
+            results = self.get_paginated_results(
+                f"/api/v2/admin/groups/{group_id}/groupMembers", items_key="data"
+            )
+            return results
+        except requests.RequestException as e:
+            log.debug("No members found for group %s: %s", group_id, e)
+            return []
+
+    def get_admin_roles(self) -> Dict[str, str]:
+        """Fetch all Foundry roles and return a {roleId: displayName} mapping."""
+        try:
+            roles = self.get_paginated_results("/api/v2/admin/roles", items_key="data")
+            return {r["id"]: r.get("displayName", r["id"]) for r in roles if "id" in r}
+        except requests.RequestException as e:
+            log.warning("Could not fetch admin roles (role names will be inferred from ID): %s", e)
+            return {}
 
 
 def _apply_resource_properties(resource, data: Dict) -> None:
@@ -215,10 +310,25 @@ def _apply_resource_properties(resource, data: Dict) -> None:
         resource.add_property("description", description, "str")
     if owner := data.get("owner"):
         resource.add_property("owner", owner, "str")
-    if created := data.get("createdAt"):
+    if created := data.get("createdAt") or data.get("createdTime"):
         resource.add_property("created_at", str(created), "str")
     if rtype := data.get("type"):
         resource.add_property("resource_type", rtype, "str")
+
+
+def _map_role_to_oaa_permission(role_id: str, role_display_name: str = "") -> str:
+    """Map a Foundry role (by UUID + display name) to an OAA permission name."""
+    name = role_display_name.lower() if role_display_name else role_id.lower()
+    if any(kw in name for kw in ("owner", "administer", "admin")):
+        return "owner"
+    if any(kw in name for kw in ("editor", "write", "edit")):
+        return "editor"
+    if any(kw in name for kw in ("discover",)):
+        return "discoverer"
+    if any(kw in name for kw in ("viewer", "view", "read")):
+        return "viewer"
+    # Default to least-privilege when the role name is unrecognised
+    return "viewer"
 
 
 def build_oaa_payload(
@@ -232,8 +342,19 @@ def build_oaa_payload(
         application_type=provider_name,
     )
 
-    app.add_custom_permission("viewer", [OAAPermission.DataRead])
-    app.add_custom_permission("editor", [OAAPermission.DataRead, OAAPermission.DataWrite])
+    app.add_custom_permission("discoverer", [OAAPermission.MetadataRead])
+    app.add_custom_permission("viewer", [OAAPermission.DataRead, OAAPermission.MetadataRead])
+    app.add_custom_permission("editor", [OAAPermission.DataRead, OAAPermission.DataWrite, OAAPermission.MetadataRead])
+    app.add_custom_permission(
+        "owner",
+        [
+            OAAPermission.DataRead,
+            OAAPermission.DataWrite,
+            OAAPermission.MetadataRead,
+            OAAPermission.MetadataWrite,
+            OAAPermission.NonDataAccess,
+        ],
+    )
     app.add_custom_permission(
         "admin",
         [
@@ -247,6 +368,61 @@ def build_oaa_payload(
     resource_lookup: Dict[str, object] = {}
     user_lookup: Dict[str, object] = {}
     group_lookup: Dict[str, object] = {}
+
+    # ── Users ─────────────────────────────────────────────────────────────────
+    log.info("Processing users...")
+    for user in foundry_data.get("users", []):
+        uid = user.get("id") or user.get("userId")
+        if not uid:
+            log.warning("User missing id — skipping")
+            continue
+        username = user.get("username") or user.get("login") or uid
+        oaa_user = app.add_local_user(username, unique_id=uid)
+        email = user.get("email")
+        if email:
+            oaa_user.email = email
+        elif "@" in username:
+            oaa_user.email = username
+        user_lookup[uid] = oaa_user
+        log.debug("Added user: %s (%s)", username, uid)
+
+    # ── Groups ────────────────────────────────────────────────────────────────
+    log.info("Processing groups...")
+    for group in foundry_data.get("groups", []):
+        gid = group.get("id") or group.get("groupId")
+        if not gid:
+            log.warning("Group missing id — skipping")
+            continue
+        name = group.get("name") or group.get("displayName") or gid
+        oaa_group = app.add_local_group(name, unique_id=gid)
+        group_lookup[gid] = oaa_group
+        log.debug("Added group: %s (%s)", name, gid)
+
+    # ── Group memberships ─────────────────────────────────────────────────────
+    log.info("Processing group memberships...")
+    membership_count = 0
+    for membership in foundry_data.get("group_memberships", []):
+        group_id = membership.get("group_id")
+        # v2 admin/groups/{id}/groupMembers returns {principalType, principalId}
+        m_type = membership.get("principalType", "").upper()
+        m_id = membership.get("principalId")
+        if not group_id or not m_id:
+            continue
+        oaa_group = group_lookup.get(group_id)
+        if oaa_group is None:
+            continue
+        if m_type == "USER":
+            oaa_user = user_lookup.get(m_id)
+            if oaa_user:
+                oaa_user.add_group(oaa_group)
+                membership_count += 1
+        elif m_type in ("GROUP", "TEAM"):
+            # nested group — ensure the child group exists then add it as a member
+            child_group = group_lookup.get(m_id)
+            if child_group:
+                child_group.add_group(oaa_group)
+                membership_count += 1
+    log.info("Linked %d group memberships", membership_count)
 
     # ── Workspaces ────────────────────────────────────────────────────────────
     log.info("Processing workspaces...")
@@ -304,6 +480,8 @@ def build_oaa_payload(
         log.debug("Added resource: %s (%s)", name, rid)
 
     # ── Access policies ───────────────────────────────────────────────────────
+    # v2 filesystem/resources/{rid}/roles returns ResourceRole objects:
+    #   {resourceRolePrincipal: {type, principalId, principalType}, roleId}
     log.info("Processing access policies...")
     total_permissions = 0
     for resource_id, policies in foundry_data.get("access_policies", {}).items():
@@ -311,38 +489,46 @@ def build_oaa_payload(
         if oaa_resource is None:
             continue
         for policy in policies:
-            principal = policy.get("principal", {})
-            role = policy.get("role", "viewer").lower()
-            p_type = principal.get("type", "").upper()
-            p_id = principal.get("userId") or principal.get("groupId") or principal.get("id")
-            p_name = principal.get("username") or principal.get("name") or p_id
+            rr_principal = policy.get("resourceRolePrincipal", {})
+            principal_type_discriminator = rr_principal.get("type", "")
+            role_id = policy.get("roleId", "")
+            # Map Foundry roleId (UUID) to an OAA permission name by
+            # looking up the role in the role_lookup dict (fetched from admin API),
+            # then matching keywords; default to "viewer" (least privilege).
+            role_display = foundry_data.get("role_lookup", {}).get(role_id, "")
+            role = _map_role_to_oaa_permission(role_id, role_display)
 
-            if not p_id or not p_name:
+            if principal_type_discriminator == "everyone":
+                # Skip platform-wide "everyone" grants — not meaningful per-principal
+                continue
+
+            p_id = rr_principal.get("principalId")
+            p_type = rr_principal.get("principalType", "").upper()  # USER or GROUP
+            if not p_id:
                 continue
 
             if p_type == "USER":
                 if p_id not in user_lookup:
-                    user = app.add_local_user(p_name, unique_id=p_id)
-                    if "@" in p_name:
-                        user.email = p_name
-                    user_lookup[p_id] = user
+                    oaa_user = app.add_local_user(p_id, unique_id=p_id)
+                    user_lookup[p_id] = oaa_user
                 user_lookup[p_id].add_permission(role, resources=[oaa_resource])
                 total_permissions += 1
-            elif p_type in ("GROUP", "TEAM"):
+            elif p_type == "GROUP":
                 if p_id not in group_lookup:
-                    group_lookup[p_id] = app.add_local_group(p_name, unique_id=p_id)
+                    group_lookup[p_id] = app.add_local_group(p_id, unique_id=p_id)
                 group_lookup[p_id].add_permission(role, resources=[oaa_resource])
                 total_permissions += 1
 
     log.info(
         "Payload: %d workspaces, %d projects, %d datasets, %d resources, "
-        "%d users, %d groups, %d permissions",
+        "%d users, %d groups, %d memberships, %d permissions",
         len(foundry_data.get("workspaces", [])),
         len(foundry_data.get("projects", [])),
         len(foundry_data.get("datasets", [])),
         len(foundry_data.get("resources", [])),
         len(user_lookup),
         len(group_lookup),
+        membership_count,
         total_permissions,
     )
     return app
@@ -457,6 +643,20 @@ def main() -> None:
     projects = foundry.get_projects()
     datasets = foundry.get_datasets()
     resources = foundry.get_resources()
+    users = foundry.get_users()
+    groups = foundry.get_groups()
+    role_lookup = foundry.get_admin_roles()
+    log.info("Fetched %d role definitions", len(role_lookup))
+
+    # Fetch group memberships
+    log.info("Fetching group memberships...")
+    group_memberships: List[Dict] = []
+    for group in groups:
+        gid = group.get("id") or group.get("groupId")
+        if gid:
+            for member in foundry.get_group_members(gid):
+                group_memberships.append({"group_id": gid, **member})
+    log.info("Retrieved %d group membership entries", len(group_memberships))
 
     # Fetch access policies for every discovered entity
     access_policies: Dict[str, List] = {}
@@ -472,7 +672,11 @@ def main() -> None:
         "projects": projects,
         "datasets": datasets,
         "resources": resources,
+        "users": users,
+        "groups": groups,
+        "group_memberships": group_memberships,
         "access_policies": access_policies,
+        "role_lookup": role_lookup,
     }
 
     log.info("Building OAA payload...")
