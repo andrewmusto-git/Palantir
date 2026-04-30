@@ -352,7 +352,7 @@ def build_oaa_payload(
             OAAPermission.DataWrite,
             OAAPermission.MetadataRead,
             OAAPermission.MetadataWrite,
-            OAAPermission.NonDataAccess,
+            OAAPermission.NonData,
         ],
     )
     app.add_custom_permission(
