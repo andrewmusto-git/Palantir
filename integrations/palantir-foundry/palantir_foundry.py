@@ -632,12 +632,14 @@ def main() -> None:
         sys.exit(1)
 
     # Connect and collect data
+    print("[1/5] Connecting to Palantir Foundry...")
     log.info("Connecting to Palantir Foundry at %s", config["foundry_base_url"])
     foundry = PalantirFoundryClient(
         base_url=config["foundry_base_url"],
         api_token=config["foundry_api_token"],
     )
 
+    print("[2/5] Collecting data...")
     log.info("Collecting data from Palantir Foundry...")
     workspaces = foundry.get_workspaces()
     projects = foundry.get_projects()
@@ -659,6 +661,7 @@ def main() -> None:
     log.info("Retrieved %d group membership entries", len(group_memberships))
 
     # Fetch access policies for every discovered entity
+    print("[3/5] Fetching access policies...")
     access_policies: Dict[str, List] = {}
     for entity in workspaces + projects + datasets + resources:
         rid = entity.get("rid") or entity.get("id")
@@ -679,10 +682,12 @@ def main() -> None:
         "role_lookup": role_lookup,
     }
 
+    print("[4/5] Building OAA payload...")
     log.info("Building OAA payload...")
     app = build_oaa_payload(foundry_data, args.provider_name, args.datasource_name)
 
     if args.dry_run:
+        print("[5/5] Dry run complete.")
         log.info("[DRY RUN] Payload built — skipping Veza push")
         if args.save_json:
             out = f"{args.datasource_name.lower().replace(' ', '_')}_oaa_payload.json"
@@ -691,6 +696,7 @@ def main() -> None:
             log.info("Payload saved to %s", out)
         sys.exit(0)
 
+    print("[5/5] Pushing to Veza...")
     push_to_veza(
         veza_url=config["veza_url"],
         veza_api_key=config["veza_api_key"],
@@ -699,6 +705,7 @@ def main() -> None:
         app=app,
         save_json=args.save_json,
     )
+    print("Done.")
     log.info("Integration completed successfully")
 
 
