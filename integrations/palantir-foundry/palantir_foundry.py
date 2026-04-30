@@ -180,7 +180,7 @@ class PalantirFoundryClient:
                 "/api/foundry/datasets/v1/datasets", items_key="datasets"
             )
             log.info("Retrieved %d datasets", len(results))
-            return datasets
+            return results
         except requests.RequestException:
             log.error("Failed to fetch datasets")
             return []
