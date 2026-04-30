@@ -295,13 +295,11 @@ class PalantirFoundryClient:
             return []
 
     def get_admin_roles(self) -> Dict[str, str]:
-        """Fetch all Foundry roles and return a {roleId: displayName} mapping."""
-        try:
-            roles = self.get_paginated_results("/api/v2/admin/roles", items_key="data")
-            return {r["id"]: r.get("displayName", r["id"]) for r in roles if "id" in r}
-        except requests.RequestException as e:
-            log.warning("Could not fetch admin roles (role names will be inferred from ID): %s", e)
-            return {}
+        """No-op: /api/v2/admin/roles does not exist in Foundry v2 API.
+        Role names are inferred directly from the roleId returned by the
+        per-resource /api/v2/filesystem/resources/{rid}/roles endpoint.
+        """
+        return {}
 
 
 def _apply_resource_properties(resource, data: Dict) -> None:
@@ -381,8 +379,10 @@ def build_oaa_payload(
         email = user.get("email")
         if email:
             oaa_user.email = email
+            oaa_user.identity_to_idp = email
         elif "@" in username:
             oaa_user.email = username
+            oaa_user.identity_to_idp = username
         user_lookup[uid] = oaa_user
         log.debug("Added user: %s (%s)", username, uid)
 
@@ -651,8 +651,8 @@ def main() -> None:
     resources = foundry.get_resources()
     users = foundry.get_users()
     groups = foundry.get_groups()
-    role_lookup = foundry.get_admin_roles()
-    log.info("Fetched %d role definitions", len(role_lookup))
+    role_lookup = foundry.get_admin_roles()  # returns {} — role names inferred from roleId directly
+    log.debug("Role lookup disabled: role names inferred from roleId returned by per-resource roles endpoint")
 
     # Fetch group memberships
     log.info("Fetching group memberships...")
