@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 from oaaclient.client import OAAClient, OAAClientError
-from oaaclient.templates import CustomApplication, OAAPermission
+from oaaclient.templates import CustomApplication, OAAPermission, OAAPropertyType
 
 log = logging.getLogger(__name__)
 
@@ -301,17 +301,48 @@ class PalantirFoundryClient:
         """
         return {}
 
+    def get_ontologies(self) -> List[Dict]:
+        """Fetch all Ontologies visible to the current user."""
+        try:
+            data = self._make_request("GET", "/api/v1/ontologies")
+            return data.get("data", [])
+        except requests.RequestException as e:
+            log.warning("Failed to fetch ontologies: %s", e)
+            return []
+
+    def get_all_action_types(self) -> List[Dict]:
+        """Fetch all action types across all accessible Ontologies."""
+        log.info("Fetching action types...")
+        ontologies = self.get_ontologies()
+        if not ontologies:
+            log.warning("No ontologies found — skipping action types")
+            return []
+        all_action_types: List[Dict] = []
+        for ont in ontologies:
+            rid = ont.get("rid")
+            if not rid:
+                continue
+            try:
+                types = self.get_paginated_results(
+                    f"/api/v1/ontologies/{rid}/actionTypes", items_key="data"
+                )
+                all_action_types.extend(types)
+            except requests.RequestException as e:
+                log.warning("Failed to fetch action types for ontology %s: %s", rid, e)
+        log.info("Retrieved %d action types", len(all_action_types))
+        return all_action_types
+
 
 def _apply_resource_properties(resource, data: Dict) -> None:
     """Set common metadata properties on an OAA resource object."""
     if description := data.get("description"):
-        resource.add_property("description", description, "str")
+        resource.set_property("description", description)
     if owner := data.get("owner"):
-        resource.add_property("owner", owner, "str")
+        resource.set_property("owner", owner)
     if created := data.get("createdAt") or data.get("createdTime"):
-        resource.add_property("created_at", str(created), "str")
+        resource.set_property("created_at", str(created))
     if rtype := data.get("type"):
-        resource.add_property("resource_type", rtype, "str")
+        resource.set_property("resource_type", rtype)
 
 
 def _map_role_to_oaa_permission(role_id: str, role_display_name: str = "") -> str:
@@ -362,6 +393,18 @@ def build_oaa_payload(
             OAAPermission.MetadataWrite,
         ],
     )
+    app.add_custom_permission("can_apply", [OAAPermission.NonData, OAAPermission.MetadataRead])
+
+    # Register custom properties for each resource type that uses set_property()
+    for rtype in ("Workspace", "Project", "Dataset", "Resource"):
+        app.property_definitions.define_resource_property(rtype, "description", OAAPropertyType.STRING)
+        app.property_definitions.define_resource_property(rtype, "owner", OAAPropertyType.STRING)
+        app.property_definitions.define_resource_property(rtype, "created_at", OAAPropertyType.STRING)
+        app.property_definitions.define_resource_property(rtype, "resource_type", OAAPropertyType.STRING)
+    app.property_definitions.define_resource_property("Dataset", "row_count", OAAPropertyType.STRING)
+    app.property_definitions.define_resource_property("ActionType", "api_name", OAAPropertyType.STRING)
+    app.property_definitions.define_resource_property("ActionType", "status", OAAPropertyType.STRING)
+    app.property_definitions.define_resource_property("ActionType", "description", OAAPropertyType.STRING)
 
     resource_lookup: Dict[str, object] = {}
     user_lookup: Dict[str, object] = {}
@@ -436,7 +479,7 @@ def build_oaa_payload(
             log.warning("Workspace missing rid/id — skipping")
             continue
         name = workspace.get("displayName") or workspace.get("name") or rid
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Workspace")
+        resource = app.add_resource(name=name, resource_type="Workspace", unique_id=rid)
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, workspace)
         log.debug("Added workspace: %s (%s)", name, rid)
@@ -449,7 +492,7 @@ def build_oaa_payload(
             log.warning("Project missing rid/id — skipping")
             continue
         name = project.get("displayName") or project.get("name") or rid
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Project")
+        resource = app.add_resource(name=name, resource_type="Project", unique_id=rid)
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, project)
         log.debug("Added project: %s (%s)", name, rid)
@@ -462,11 +505,11 @@ def build_oaa_payload(
             log.warning("Dataset missing rid/id — skipping")
             continue
         name = dataset.get("displayName") or dataset.get("name") or rid
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Dataset")
+        resource = app.add_resource(name=name, resource_type="Dataset", unique_id=rid)
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, dataset)
         if row_count := dataset.get("rowCount"):
-            resource.add_property("row_count", str(row_count), "str")
+            resource.set_property("row_count", str(row_count))
         log.debug("Added dataset: %s (%s)", name, rid)
 
     # ── Generic resources ─────────────────────────────────────────────────────
@@ -478,10 +521,27 @@ def build_oaa_payload(
             continue
         name = res.get("displayName") or res.get("name") or rid
         rtype = res.get("type", "Resource")
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type=rtype)
+        resource = app.add_resource(name=name, resource_type=rtype, unique_id=rid)
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, res)
         log.debug("Added resource: %s (%s)", name, rid)
+
+    # ── Action Types ──────────────────────────────────────────────────────────
+    log.info("Processing action types...")
+    for action_type in foundry_data.get("action_types", []):
+        rid = action_type.get("rid")
+        if not rid:
+            continue
+        name = action_type.get("displayName") or action_type.get("apiName") or rid
+        resource = app.add_resource(name=name, resource_type="ActionType", unique_id=rid)
+        resource_lookup[rid] = resource
+        if api_name := action_type.get("apiName"):
+            resource.set_property("api_name", api_name)
+        if status := action_type.get("status"):
+            resource.set_property("status", status)
+        if desc := action_type.get("description"):
+            resource.set_property("description", desc)
+        log.debug("Added action type: %s (%s)", name, rid)
 
     # ── Access policies ───────────────────────────────────────────────────────
     # v2 filesystem/resources/{rid}/roles returns ResourceRole objects:
@@ -525,11 +585,12 @@ def build_oaa_payload(
 
     log.info(
         "Payload: %d workspaces, %d projects, %d datasets, %d resources, "
-        "%d users, %d groups, %d memberships, %d permissions",
+        "%d action types, %d users, %d groups, %d memberships, %d permissions",
         len(foundry_data.get("workspaces", [])),
         len(foundry_data.get("projects", [])),
         len(foundry_data.get("datasets", [])),
         len(foundry_data.get("resources", [])),
+        len(foundry_data.get("action_types", [])),
         len(user_lookup),
         len(group_lookup),
         membership_count,
@@ -653,6 +714,7 @@ def main() -> None:
     groups = foundry.get_groups()
     role_lookup = foundry.get_admin_roles()  # returns {} — role names inferred from roleId directly
     log.debug("Role lookup disabled: role names inferred from roleId returned by per-resource roles endpoint")
+    action_types = foundry.get_all_action_types()
 
     # Fetch group memberships
     log.info("Fetching group memberships...")
@@ -667,7 +729,7 @@ def main() -> None:
     # Fetch access policies for every discovered entity
     print("[3/5] Fetching access policies...")
     access_policies: Dict[str, List] = {}
-    for entity in workspaces + projects + datasets + resources:
+    for entity in workspaces + projects + datasets + resources + action_types:
         rid = entity.get("rid") or entity.get("id")
         if rid:
             policies = foundry.get_access_policies(rid)
@@ -679,6 +741,7 @@ def main() -> None:
         "projects": projects,
         "datasets": datasets,
         "resources": resources,
+        "action_types": action_types,
         "users": users,
         "groups": groups,
         "group_memberships": group_memberships,
