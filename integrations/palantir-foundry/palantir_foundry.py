@@ -18,7 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 from oaaclient.client import OAAClient, OAAClientError
-from oaaclient.templates import CustomApplication, OAAPermission, OAAPropertyType
+from oaaclient.templates import CustomApplication, OAAPermission
 
 log = logging.getLogger(__name__)
 
@@ -295,54 +295,25 @@ class PalantirFoundryClient:
             return []
 
     def get_admin_roles(self) -> Dict[str, str]:
-        """No-op: /api/v2/admin/roles does not exist in Foundry v2 API.
-        Role names are inferred directly from the roleId returned by the
-        per-resource /api/v2/filesystem/resources/{rid}/roles endpoint.
-        """
-        return {}
-
-    def get_ontologies(self) -> List[Dict]:
-        """Fetch all Ontologies visible to the current user."""
+        """Fetch all Foundry roles and return a {roleId: displayName} mapping."""
         try:
-            data = self._make_request("GET", "/api/v1/ontologies")
-            return data.get("data", [])
+            roles = self.get_paginated_results("/api/v2/admin/roles", items_key="data")
+            return {r["id"]: r.get("displayName", r["id"]) for r in roles if "id" in r}
         except requests.RequestException as e:
-            log.warning("Failed to fetch ontologies: %s", e)
-            return []
-
-    def get_all_action_types(self) -> List[Dict]:
-        """Fetch all action types across all accessible Ontologies."""
-        log.info("Fetching action types...")
-        ontologies = self.get_ontologies()
-        if not ontologies:
-            log.warning("No ontologies found — skipping action types")
-            return []
-        all_action_types: List[Dict] = []
-        for ont in ontologies:
-            rid = ont.get("rid")
-            if not rid:
-                continue
-            try:
-                types = self.get_paginated_results(
-                    f"/api/v1/ontologies/{rid}/actionTypes", items_key="data"
-                )
-                all_action_types.extend(types)
-            except requests.RequestException as e:
-                log.warning("Failed to fetch action types for ontology %s: %s", rid, e)
-        log.info("Retrieved %d action types", len(all_action_types))
-        return all_action_types
+            log.warning("Could not fetch admin roles (role names will be inferred from ID): %s", e)
+            return {}
 
 
 def _apply_resource_properties(resource, data: Dict) -> None:
     """Set common metadata properties on an OAA resource object."""
     if description := data.get("description"):
-        resource.set_property("description", description)
+        resource.add_property("description", description, "str")
     if owner := data.get("owner"):
-        resource.set_property("owner", owner)
+        resource.add_property("owner", owner, "str")
     if created := data.get("createdAt") or data.get("createdTime"):
-        resource.set_property("created_at", str(created))
+        resource.add_property("created_at", str(created), "str")
     if rtype := data.get("type"):
-        resource.set_property("resource_type", rtype)
+        resource.add_property("resource_type", rtype, "str")
 
 
 def _map_role_to_oaa_permission(role_id: str, role_display_name: str = "") -> str:
@@ -365,7 +336,13 @@ def build_oaa_payload(
     provider_name: str = "Palantir Foundry",
     datasource_name: str = "palantir-foundry",
 ) -> CustomApplication:
-    """Build OAA CustomApplication from Palantir Foundry data."""
+    """Build OAA CustomApplication from Palantir Foundry data.
+
+    Permission model: User > Group > Permissions > Application
+      - Users are members of Groups
+      - Groups hold Permissions on Application resources
+      - Direct user-to-resource grants are not modelled; all access flows via group membership
+    """
     app = CustomApplication(
         name=datasource_name,
         application_type=provider_name,
@@ -393,18 +370,6 @@ def build_oaa_payload(
             OAAPermission.MetadataWrite,
         ],
     )
-    app.add_custom_permission("can_apply", [OAAPermission.NonData, OAAPermission.MetadataRead])
-
-    # Register custom properties for each resource type that uses set_property()
-    for rtype in ("Workspace", "Project", "Dataset", "Resource"):
-        app.property_definitions.define_resource_property(rtype, "description", OAAPropertyType.STRING)
-        app.property_definitions.define_resource_property(rtype, "owner", OAAPropertyType.STRING)
-        app.property_definitions.define_resource_property(rtype, "created_at", OAAPropertyType.STRING)
-        app.property_definitions.define_resource_property(rtype, "resource_type", OAAPropertyType.STRING)
-    app.property_definitions.define_resource_property("Dataset", "row_count", OAAPropertyType.STRING)
-    app.property_definitions.define_resource_property("ActionType", "api_name", OAAPropertyType.STRING)
-    app.property_definitions.define_resource_property("ActionType", "status", OAAPropertyType.STRING)
-    app.property_definitions.define_resource_property("ActionType", "description", OAAPropertyType.STRING)
 
     resource_lookup: Dict[str, object] = {}
     user_lookup: Dict[str, object] = {}
@@ -422,10 +387,8 @@ def build_oaa_payload(
         email = user.get("email")
         if email:
             oaa_user.email = email
-            oaa_user.identity_to_idp = email
         elif "@" in username:
             oaa_user.email = username
-            oaa_user.identity_to_idp = username
         user_lookup[uid] = oaa_user
         log.debug("Added user: %s (%s)", username, uid)
 
@@ -454,20 +417,16 @@ def build_oaa_payload(
         oaa_group = group_lookup.get(group_id)
         if oaa_group is None:
             continue
-        # The SDK's add_group() calls str() on whatever is passed, which would
-        # produce "Local Group - {name} ({unique_id})" — not a valid Veza
-        # group reference. Pass the identifier string directly instead.
-        group_identifier = oaa_group.unique_id if oaa_group.unique_id else oaa_group.name
         if m_type == "USER":
             oaa_user = user_lookup.get(m_id)
             if oaa_user:
-                oaa_user.add_group(group_identifier)
+                oaa_user.add_group(oaa_group)
                 membership_count += 1
         elif m_type in ("GROUP", "TEAM"):
             # nested group — ensure the child group exists then add it as a member
             child_group = group_lookup.get(m_id)
             if child_group:
-                child_group.add_group(group_identifier)
+                child_group.add_group(oaa_group)
                 membership_count += 1
     log.info("Linked %d group memberships", membership_count)
 
@@ -479,7 +438,7 @@ def build_oaa_payload(
             log.warning("Workspace missing rid/id — skipping")
             continue
         name = workspace.get("displayName") or workspace.get("name") or rid
-        resource = app.add_resource(name=name, resource_type="Workspace", unique_id=rid)
+        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Workspace")
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, workspace)
         log.debug("Added workspace: %s (%s)", name, rid)
@@ -492,7 +451,7 @@ def build_oaa_payload(
             log.warning("Project missing rid/id — skipping")
             continue
         name = project.get("displayName") or project.get("name") or rid
-        resource = app.add_resource(name=name, resource_type="Project", unique_id=rid)
+        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Project")
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, project)
         log.debug("Added project: %s (%s)", name, rid)
@@ -505,11 +464,11 @@ def build_oaa_payload(
             log.warning("Dataset missing rid/id — skipping")
             continue
         name = dataset.get("displayName") or dataset.get("name") or rid
-        resource = app.add_resource(name=name, resource_type="Dataset", unique_id=rid)
+        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Dataset")
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, dataset)
         if row_count := dataset.get("rowCount"):
-            resource.set_property("row_count", str(row_count))
+            resource.add_property("row_count", str(row_count), "str")
         log.debug("Added dataset: %s (%s)", name, rid)
 
     # ── Generic resources ─────────────────────────────────────────────────────
@@ -521,33 +480,21 @@ def build_oaa_payload(
             continue
         name = res.get("displayName") or res.get("name") or rid
         rtype = res.get("type", "Resource")
-        resource = app.add_resource(name=name, resource_type=rtype, unique_id=rid)
+        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type=rtype)
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, res)
         log.debug("Added resource: %s (%s)", name, rid)
 
-    # ── Action Types ──────────────────────────────────────────────────────────
-    log.info("Processing action types...")
-    for action_type in foundry_data.get("action_types", []):
-        rid = action_type.get("rid")
-        if not rid:
-            continue
-        name = action_type.get("displayName") or action_type.get("apiName") or rid
-        resource = app.add_resource(name=name, resource_type="ActionType", unique_id=rid)
-        resource_lookup[rid] = resource
-        if api_name := action_type.get("apiName"):
-            resource.set_property("api_name", api_name)
-        if status := action_type.get("status"):
-            resource.set_property("status", status)
-        if desc := action_type.get("description"):
-            resource.set_property("description", desc)
-        log.debug("Added action type: %s (%s)", name, rid)
-
     # ── Access policies ───────────────────────────────────────────────────────
     # v2 filesystem/resources/{rid}/roles returns ResourceRole objects:
     #   {resourceRolePrincipal: {type, principalId, principalType}, roleId}
-    log.info("Processing access policies...")
+    #
+    # Permission model: User > Group > Permissions > Application
+    # Only GROUP-level grants are applied to resources. Direct USER grants are
+    # intentionally skipped — users gain access exclusively through group membership.
+    log.info("Processing access policies (group-based grants only)...")
     total_permissions = 0
+    skipped_direct_user_grants = 0
     for resource_id, policies in foundry_data.get("access_policies", {}).items():
         oaa_resource = resource_lookup.get(resource_id)
         if oaa_resource is None:
@@ -572,25 +519,32 @@ def build_oaa_payload(
                 continue
 
             if p_type == "USER":
-                if p_id not in user_lookup:
-                    oaa_user = app.add_local_user(p_id, unique_id=p_id)
-                    user_lookup[p_id] = oaa_user
-                user_lookup[p_id].add_permission(role, resources=[oaa_resource])
-                total_permissions += 1
+                # Permission model is User > Group > Permissions > Application.
+                # Direct user grants are skipped; access flows via group membership only.
+                log.debug(
+                    "Skipping direct user grant: user %s, role %s, resource %s",
+                    p_id, role, resource_id,
+                )
+                skipped_direct_user_grants += 1
             elif p_type == "GROUP":
                 if p_id not in group_lookup:
                     group_lookup[p_id] = app.add_local_group(p_id, unique_id=p_id)
                 group_lookup[p_id].add_permission(role, resources=[oaa_resource])
                 total_permissions += 1
 
+    if skipped_direct_user_grants:
+        log.info(
+            "Skipped %d direct user permission grant(s) — access flows via group membership",
+            skipped_direct_user_grants,
+        )
+
     log.info(
         "Payload: %d workspaces, %d projects, %d datasets, %d resources, "
-        "%d action types, %d users, %d groups, %d memberships, %d permissions",
+        "%d users, %d groups, %d memberships, %d permissions",
         len(foundry_data.get("workspaces", [])),
         len(foundry_data.get("projects", [])),
         len(foundry_data.get("datasets", [])),
         len(foundry_data.get("resources", [])),
-        len(foundry_data.get("action_types", [])),
         len(user_lookup),
         len(group_lookup),
         membership_count,
@@ -712,9 +666,8 @@ def main() -> None:
     resources = foundry.get_resources()
     users = foundry.get_users()
     groups = foundry.get_groups()
-    role_lookup = foundry.get_admin_roles()  # returns {} — role names inferred from roleId directly
-    log.debug("Role lookup disabled: role names inferred from roleId returned by per-resource roles endpoint")
-    action_types = foundry.get_all_action_types()
+    role_lookup = foundry.get_admin_roles()
+    log.info("Fetched %d role definitions", len(role_lookup))
 
     # Fetch group memberships
     log.info("Fetching group memberships...")
@@ -729,7 +682,7 @@ def main() -> None:
     # Fetch access policies for every discovered entity
     print("[3/5] Fetching access policies...")
     access_policies: Dict[str, List] = {}
-    for entity in workspaces + projects + datasets + resources + action_types:
+    for entity in workspaces + projects + datasets + resources:
         rid = entity.get("rid") or entity.get("id")
         if rid:
             policies = foundry.get_access_policies(rid)
@@ -741,7 +694,6 @@ def main() -> None:
         "projects": projects,
         "datasets": datasets,
         "resources": resources,
-        "action_types": action_types,
         "users": users,
         "groups": groups,
         "group_memberships": group_memberships,
