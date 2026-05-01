@@ -39,7 +39,7 @@ The integration follows this five-step flow:
 - **Network Firewall**: Outbound HTTPS (port 443) allowed
 
 ### Palantir Foundry Prerequisites
-- **Active Palantir Foundry instance** (e.g. `https://westrock.palantirfoundry.com`)
+- **Active Palantir Foundry instance** (e.g. `https://your-company.palantirfoundry.com`)
 - **API Token** with at minimum `api:admin-read` and `api:ontologies-read` scopes
 - **Required API Endpoints**:
   - `GET /api/v2/admin/users` — list all users (paginated)
@@ -60,7 +60,7 @@ The integration follows this five-step flow:
 ### Network Requirements
 ```
 Outbound HTTPS (port 443) to:
-  - Palantir Foundry: westrock.palantirfoundry.com
+  - Palantir Foundry: your-company.palantirfoundry.com
   - Veza instance: your-veza-domain.veza.com
   - PyPI (for package installation): pypi.org, pypi.python.org
 
@@ -131,7 +131,7 @@ cp .env.template .env
 Edit `.env` with your credentials:
 ```bash
 # Palantir Foundry Configuration
-FOUNDRY_BASE_URL=https://westrock.palantirfoundry.com
+FOUNDRY_BASE_URL=https://your-company.palantirfoundry.com
 FOUNDRY_API_TOKEN=your_api_token_here
 
 # Veza Configuration
@@ -257,7 +257,7 @@ Logs are written to `logs/palantir_foundry_<DDMMYYYY-HHMM>.log` with hourly rota
 
 ```
 2026-04-30T17:20:41 INFO     Loaded .env from .env
-2026-04-30T17:20:41 INFO     Connecting to Palantir Foundry at https://westrock.palantirfoundry.com
+2026-04-30T17:20:41 INFO     Connecting to Palantir Foundry at https://your-company.palantirfoundry.com
 2026-04-30T17:20:41 INFO     Successfully authenticated with Palantir Foundry
 2026-04-30T17:20:42 INFO     Retrieved 2341 users
 2026-04-30T17:20:46 INFO     Retrieved 496 groups
@@ -279,21 +279,21 @@ Logs are written to `logs/palantir_foundry_<DDMMYYYY-HHMM>.log` with hourly rota
 1. Verify `FOUNDRY_API_TOKEN` is valid and not expired
 2. Token must have at minimum `api:admin-read` and `api:ontologies-read` scopes
 3. Verify `FOUNDRY_BASE_URL` does not have a trailing slash
-4. Test connectivity: `curl -H "Authorization: Bearer YOUR_TOKEN" https://westrock.palantirfoundry.com/api/v2/admin/users?pageSize=1`
+4. Test connectivity: `curl -H "Authorization: Bearer YOUR_TOKEN" https://your-company.palantirfoundry.com/api/v2/admin/users?pageSize=1`
 
 ### Network Errors
 
 **Error**: `Connection timeout`, `Failed to connect to Palantir Foundry`
 
 **Solutions**:
-1. Verify internet connectivity: `ping westrock.palantirfoundry.com`
+1. Verify internet connectivity: `ping your-company.palantirfoundry.com`
 2. Check firewall rules allow HTTPS (port 443) outbound
 3. If using proxy, configure environment variables:
    ```bash
    export HTTP_PROXY=http://proxy.company.com:8080
    export HTTPS_PROXY=https://proxy.company.com:8080
    ```
-4. Test with curl: `curl -v https://westrock.palantirfoundry.com/api/v2/admin/users?pageSize=1`
+4. Test with curl: `curl -v https://your-company.palantirfoundry.com/api/v2/admin/users?pageSize=1`
 
 ### Veza Push Errors
 
@@ -335,7 +335,7 @@ Logs are written to `logs/palantir_foundry_<DDMMYYYY-HHMM>.log` with hourly rota
 
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
-| `FOUNDRY_BASE_URL` | Yes | Base URL of Palantir Foundry instance | `https://westrock.palantirfoundry.com` |
+| `FOUNDRY_BASE_URL` | Yes | Base URL of Palantir Foundry instance | `https://your-company.palantirfoundry.com` |
 | `FOUNDRY_API_TOKEN` | Yes | Bearer token for Foundry API auth | `eyJwbG50ci...` |
 | `VEZA_URL` | Yes | Base URL of Veza instance | `https://your-instance.vezacloud.com` |
 | `VEZA_API_KEY` | Yes | API key for Veza OAA push | `k1Mx...` |
