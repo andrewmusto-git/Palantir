@@ -2,31 +2,30 @@
 
 ## Overview
 
-This integration script collects data governance and access control information from **Palantir Foundry** and pushes it to **Veza** via the Open Authorization API (OAA). The connector provides read-only visibility into:
+This integration script collects identity, access control, and Ontology information from **Palantir Foundry** and pushes it to **Veza** via the Open Authorization API (OAA). The connector provides read-only visibility into:
 
-- **Workspaces** — Logical groupings for collaborative work within Foundry
-- **Projects** — Organizational units and containers within workspaces
-- **Datasets** — Data assets with complete metadata and lineage information
-- **Resources** — Generic resources and custom objects within Foundry
-- **Access Policies** — Fine-grained permissions and role-based access controls
+- **Users** — All platform users with email and identity linkage
+- **Groups** — All platform groups with full membership graphs (including nested groups)
+- **Workspaces** — Top-level spaces (filesystem root containers)
+- **Projects** — Organisational project folders within spaces
+- **Datasets** — Data assets with metadata
+- **Resources** — Other filesystem objects (notebooks, code repos, etc.)
+- **Action Types** — Ontology action types (create/edit/delete workflows), with per-principal access policies
+- **Access Policies** — Role grants on all resource types, mapped to Veza permissions
 
-All data flows through Veza's OAA model, enabling centralized visibility into data governance, lineage, and access management across your Palantir Foundry deployment at Westrock.
+All data flows through Veza's OAA model, enabling centralised visibility into identity, access, and Ontology governance across your Palantir Foundry deployment.
 
 ---
 
 ## How It Works
 
-The integration follows this flow:
+The integration follows this five-step flow:
 
-1. **Authenticate** — Validates credentials with Palantir Foundry API using bearer token authentication
-2. **Fetch Resources** — Retrieves workspaces, projects, datasets, and resources from Foundry APIs
-3. **Build Payload** — Constructs a Veza CustomApplication object with:
-   - Workspaces as container resources
-   - Projects as organizational resources
-   - Datasets as data assets with metadata
-   - Generic resources and access policy information
-4. **Push to Veza** — Sends the complete OAA payload to Veza for indexing, analysis, and visualization
-5. **Log Results** — Tracks metrics (resources discovered, permissions mapped, warnings)
+1. **Authenticate** — Validates credentials against `GET /api/v2/admin/users?pageSize=1`
+2. **Collect identity data** — Fetches all users, groups, and group memberships (including nested)
+3. **Collect resource data** — Traverses filesystem spaces → projects → datasets; also fetches Ontology action types via `GET /api/v1/ontologies/{rid}/actionTypes`
+4. **Fetch access policies** — Calls `GET /api/v2/filesystem/resources/{rid}/roles` for every resource and action type RID
+5. **Build & push payload** — Constructs a Veza `CustomApplication` and pushes via OAA client; optionally saves the JSON payload for inspection
 
 ---
 
@@ -40,16 +39,17 @@ The integration follows this flow:
 - **Network Firewall**: Outbound HTTPS (port 443) allowed
 
 ### Palantir Foundry Prerequisites
-- **Active Palantir Foundry instance** at `https://westrock.palantirfoundry.com/`
-- **API Token** with read access to resources (obtained from Foundry admin console)
-- **Required API Endpoints**: 
-  - `GET /api/foundry/core/v1/user` — authentication and user info
-  - `GET /api/foundry/core/v1/healthcheck` — health check
-  - `GET /api/foundry/datasets/v1/datasets` — list datasets
-  - `GET /api/foundry/projects/v1/projects` — list projects
-  - `GET /api/foundry/workspaces/v1/workspaces` — list workspaces
-  - `GET /api/foundry/resources/v1/resources` — list resources
-  - `GET /api/foundry/resources/v1/resources/{id}/access-policies` — access policies
+- **Active Palantir Foundry instance** (e.g. `https://westrock.palantirfoundry.com`)
+- **API Token** with at minimum `api:admin-read` and `api:ontologies-read` scopes
+- **Required API Endpoints**:
+  - `GET /api/v2/admin/users` — list all users (paginated)
+  - `GET /api/v2/admin/groups` — list all groups (paginated)
+  - `GET /api/v2/admin/groups/{id}/groupMembers` — group membership
+  - `GET /api/v2/filesystem/spaces` — list top-level spaces
+  - `GET /api/v2/filesystem/folders/{rid}/children` — recursive filesystem traversal
+  - `GET /api/v2/filesystem/resources/{rid}/roles` — resource role grants
+  - `GET /api/v1/ontologies` — list Ontologies
+  - `GET /api/v1/ontologies/{rid}/actionTypes` — list action types (paginated)
 
 ### Veza Prerequisites
 - **Active Veza instance** with API access enabled
@@ -139,31 +139,22 @@ VEZA_URL=https://your-veza-instance.veza.com
 VEZA_API_KEY=your_api_key_here
 ```
 
-### Step 5: Test Connection
+### Step 5: Run a dry-run
 
 ```bash
-python3 palantir_foundry.py --test
+python3 palantir_foundry.py --dry-run --save-json --log-level DEBUG
 ```
 
-Expected output:
-```
-2024-04-27 10:15:23,456 - __main__ - INFO - Initializing Palantir Foundry client...
-2024-04-27 10:15:24,123 - __main__ - INFO - Successfully authenticated with Palantir Foundry as: Service Account
-...
-2024-04-27 10:15:24,567 - __main__ - INFO - Test mode: connection successful
-```
+This connects to Foundry, builds the full OAA payload, and saves it as `palantir-foundry_oaa_payload.json` — without pushing to Veza.
 
-### Step 6: Run Integration
+### Step 6: Run the full integration
 
 ```bash
-# Full integration (test connection, fetch data, push to Veza)
-python3 palantir_foundry.py
+# Push to Veza and save payload JSON
+python3 palantir_foundry.py --save-json
 
-# Dry-run mode (test and build payload without pushing)
-python3 palantir_foundry.py --dry-run
-
-# Using custom config file
-python3 palantir_foundry.py --config /path/to/.env
+# Custom env file
+python3 palantir_foundry.py --env-file /path/to/.env --save-json
 ```
 
 ---
@@ -172,34 +163,35 @@ python3 palantir_foundry.py --config /path/to/.env
 
 ### Command-Line Options
 
-```bash
-python3 palantir_foundry.py [OPTIONS]
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--env-file PATH` | `.env` | Path to .env configuration file |
+| `--foundry-url URL` | — | Override `FOUNDRY_BASE_URL` |
+| `--foundry-token TOKEN` | — | Override `FOUNDRY_API_TOKEN` |
+| `--veza-url URL` | — | Override `VEZA_URL` |
+| `--veza-api-key KEY` | — | Override `VEZA_API_KEY` |
+| `--provider-name NAME` | `Palantir Foundry` | Provider label in Veza UI |
+| `--datasource-name NAME` | `palantir-foundry` | Datasource label in Veza UI |
+| `--dry-run` | off | Build payload without pushing to Veza |
+| `--save-json` | off | Save OAA payload as JSON for inspection |
+| `--log-level LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
 
-Options:
-  --config PATH    Path to .env configuration file (default: .env)
-  --test           Test connection without pushing to Veza
-  --dry-run        Build payload without pushing to Veza
-  --help           Show help message and exit
+### Example: Dry-run (no Veza push)
+
+```bash
+python3 palantir_foundry.py --dry-run --save-json --log-level DEBUG
 ```
 
-### Example: Dry-Run Mode
+### Example: Full push with JSON saved
 
 ```bash
-python3 palantir_foundry.py --dry-run 2>&1 | head -100
+python3 palantir_foundry.py --save-json
 ```
 
-This will output the JSON payload that would be sent to Veza without actually pushing it.
-
-### Example: Test Connection Only
+### Example: Custom env file
 
 ```bash
-python3 palantir_foundry.py --test
-```
-
-### Example: Full Integration
-
-```bash
-python3 palantir_foundry.py
+python3 palantir_foundry.py --env-file /path/to/.env.prod --save-json
 ```
 
 ---
@@ -253,24 +245,26 @@ palantir_foundry_veza_integration.log
 
 ### Log Levels
 
-Logs are set to `INFO` level by default. To view DEBUG logs:
+Pass `--log-level DEBUG|INFO|WARNING|ERROR` at runtime. Default is `INFO`.
 
 ```bash
-# Edit palantir_foundry.py and change logging level to DEBUG
-logging.basicConfig(
-    level=logging.DEBUG,  # Change from INFO to DEBUG
-    ...
-)
+python3 palantir_foundry.py --log-level DEBUG --save-json
 ```
 
 ### Log Format
 
+Logs are written to `logs/palantir_foundry_<DDMMYYYY-HHMM>.log` with hourly rotation (24 files kept).
+
 ```
-2024-04-27 10:15:23,456 - palantir_foundry.py - INFO - Successfully authenticated with Palantir Foundry as: Service Account
-2024-04-27 10:15:24,123 - palantir_foundry.py - INFO - Fetching workspaces from Palantir Foundry...
-2024-04-27 10:15:25,789 - palantir_foundry.py - INFO - Retrieved 5 workspaces
-...
-2024-04-27 10:15:30,456 - palantir_foundry.py - INFO - Successfully pushed data to Veza
+2026-04-30T17:20:41 INFO     Loaded .env from .env
+2026-04-30T17:20:41 INFO     Connecting to Palantir Foundry at https://westrock.palantirfoundry.com
+2026-04-30T17:20:41 INFO     Successfully authenticated with Palantir Foundry
+2026-04-30T17:20:42 INFO     Retrieved 2341 users
+2026-04-30T17:20:46 INFO     Retrieved 496 groups
+2026-04-30T17:20:47 INFO     Fetched 0 role definitions
+2026-04-30T17:49:11 INFO     Fetching action types...
+2026-04-30T17:49:11 INFO     Retrieved 1735 action types
+2026-04-30T17:49:36 INFO     Successfully pushed to Veza
 ```
 
 ---
@@ -279,13 +273,13 @@ logging.basicConfig(
 
 ### Authentication Errors
 
-**Error**: `Failed to authenticate with Palantir Foundry`
+**Error**: `Failed to connect to Palantir Foundry`
 
 **Solutions**:
-1. Verify `FOUNDRY_API_TOKEN` is valid and hasn't expired
-2. Check token permissions in Palantir Foundry admin console
-3. Verify `FOUNDRY_BASE_URL` is correct: `https://westrock.palantirfoundry.com`
-4. Test connectivity: `curl -H "Authorization: Bearer YOUR_TOKEN" https://westrock.palantirfoundry.com/api/foundry/core/v1/user`
+1. Verify `FOUNDRY_API_TOKEN` is valid and not expired
+2. Token must have at minimum `api:admin-read` and `api:ontologies-read` scopes
+3. Verify `FOUNDRY_BASE_URL` does not have a trailing slash
+4. Test connectivity: `curl -H "Authorization: Bearer YOUR_TOKEN" https://westrock.palantirfoundry.com/api/v2/admin/users?pageSize=1`
 
 ### Network Errors
 
@@ -299,29 +293,29 @@ logging.basicConfig(
    export HTTP_PROXY=http://proxy.company.com:8080
    export HTTPS_PROXY=https://proxy.company.com:8080
    ```
-4. Test with curl: `curl -v https://westrock.palantirfoundry.com/api/foundry/core/v1/healthcheck`
+4. Test with curl: `curl -v https://westrock.palantirfoundry.com/api/v2/admin/users?pageSize=1`
 
 ### Veza Push Errors
 
 **Error**: `Failed to push to Veza`
 
 **Solutions**:
-1. Verify `VEZA_API_KEY` is valid
-2. Check Veza instance URL in `.env` file
-3. Ensure Veza API endpoint is accessible: `curl -H "Authorization: Bearer YOUR_KEY" https://your-veza.veza.com/api/v2/health`
-4. Check Veza API logs for detailed error messages
-5. Verify `oaaclient` library version: `pip show oaaclient`
+1. Verify `VEZA_API_KEY` is valid and has OAA push permissions
+2. Check `VEZA_URL` includes the scheme (`https://`) and no trailing slash
+3. Test: `curl -H "Authorization: Bearer YOUR_KEY" https://your-veza.veza.com/api/v1/providers`
+4. Run `--dry-run --save-json` to confirm the payload builds successfully before attempting another push
+5. Verify `oaaclient` version: `pip show oaaclient`
 
 ### Missing Data
 
 **Issue**: Fewer resources than expected appear in Veza
 
 **Solutions**:
-1. Check Palantir Foundry API token has read access to all resources
-2. Run with `--dry-run` to inspect fetched data: `python3 palantir_foundry.py --dry-run`
-3. Review logs for warnings and errors
-4. Verify user permissions in Palantir Foundry for accessing datasets/projects
-5. Check API response limits and pagination
+1. Run with `--dry-run --save-json --log-level DEBUG` and inspect the saved JSON payload
+2. Filesystem resources (spaces, projects, datasets) require filesystem scope on the token — check logs for `400 Bad Request` on `/api/v2/filesystem/spaces`
+3. Action types require `api:ontologies-read` scope — check logs for `403` or `0 action types`
+4. Review DEBUG logs for per-endpoint errors
+5. Check that the token account is not restricted to a subset of Foundry projects
 
 ### Python Version Issues
 
@@ -342,9 +336,9 @@ logging.basicConfig(
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
 | `FOUNDRY_BASE_URL` | Yes | Base URL of Palantir Foundry instance | `https://westrock.palantirfoundry.com` |
-| `FOUNDRY_API_TOKEN` | Yes | API token for Palantir Foundry authentication | `eyJhbGciOi...` |
-| `VEZA_URL` | Yes | Base URL of Veza instance | `https://your-instance.veza.com` |
-| `VEZA_API_KEY` | Yes | API key for Veza OAA authentication | `veza_api_...` |
+| `FOUNDRY_API_TOKEN` | Yes | Bearer token for Foundry API auth | `eyJwbG50ci...` |
+| `VEZA_URL` | Yes | Base URL of Veza instance | `https://your-instance.vezacloud.com` |
+| `VEZA_API_KEY` | Yes | API key for Veza OAA push | `k1Mx...` |
 
 ### File Structure
 
@@ -352,13 +346,15 @@ logging.basicConfig(
 palantir-foundry/
 ├── palantir_foundry.py              # Main integration script
 ├── requirements.txt                 # Python dependencies
-├── .env.template                    # Template for .env file
-├── .env                             # Configuration file (created during install)
-├── install_palantir_foundry.sh      # Automated installer
-├── run_integration.sh               # Wrapper script for cron
+├── .env.template                    # Credential template (no real values)
+├── .env                             # Active config (git-ignored)
+├── install_palantir_foundry.sh      # One-command installer
+├── preflight.sh                     # Pre-deployment validation script
 ├── README.md                        # This file
-├── venv/                            # Python virtual environment
-└── palantir_foundry_veza_integration.log  # Integration logs
+├── logs/                            # Rotating log files (git-ignored)
+│   └── palantir_foundry_<DDMMYYYY-HHMM>.log
+├── samples/                         # Sample source data for dry-run testing
+└── venv/                            # Python virtual environment (git-ignored)
 ```
 
 ---
@@ -380,22 +376,30 @@ The integration includes automatic pagination handling and retry logic for trans
 
 ## Data Mapping
 
-### Resource Types Mapped
+### Entity Mapping
 
-| Palantir Foundry | Veza OAA | Properties |
-|-----------------|----------|-----------|
-| Workspace | Workspace | name, description, owner, createdAt |
-| Project | Project | name, description, owner, workspace, createdAt |
-| Dataset | Dataset | name, description, owner, project, type, rowCount, createdAt, modifiedAt |
-| Resource | Resource | name, description, owner, type, createdAt |
+| Palantir Foundry | Veza OAA Type | Notes |
+|-----------------|---------------|-------|
+| User | Local User | Email linked to IdP identity |
+| Group | Local Group | Nested group memberships included |
+| Space | Resource (Workspace) | Top-level filesystem container |
+| Project folder | Resource (Project) | Identified by `rid == projectRid` |
+| Dataset | Resource (Dataset) | Includes `row_count` property |
+| Other filesystem object | Resource (type from API) | Notebooks, repos, etc. |
+| Ontology Action Type | Resource (ActionType) | Includes `api_name`, `status`, `description` |
 
-### Permission Types
+### Permission Mapping
 
-Custom permissions are created for common Foundry roles:
+Foundry role UUIDs are mapped to Veza custom permissions by matching keywords in the role display name:
 
-- `viewer` — Read-only access (DataRead)
-- `editor` — Read and write access (DataRead, DataWrite)
-- `admin` — Full access (DataRead, DataWrite, MetadataRead, MetadataWrite)
+| Foundry Role Keywords | Veza Permission | OAA Capabilities |
+|-----------------------|-----------------|------------------|
+| `owner`, `admin`, `administer` | `owner` | DataRead, DataWrite, MetadataRead, MetadataWrite, NonData |
+| `editor`, `write`, `edit` | `editor` | DataRead, DataWrite, MetadataRead |
+| `discover` | `discoverer` | MetadataRead |
+| `viewer`, `view`, `read` (default) | `viewer` | DataRead, MetadataRead |
+| (action type access) | `can_apply` | NonData, MetadataRead |
+| (platform admin) | `admin` | DataRead, DataWrite, MetadataRead, MetadataWrite |
 
 ---
 
@@ -479,13 +483,29 @@ pip install -r requirements.txt --upgrade
 
 ## Changelog
 
-### Version 1.0.0 (2024-04-27)
+### Version 1.2.0 (2026-05-01)
+
+- Add action type mapping via `GET /api/v1/ontologies/{rid}/actionTypes`
+- Add `can_apply` custom permission for action type access
+- Fix `add_resource()` SDK kwargs (`name=`, `resource_type=`, `unique_id=`)
+- Fix `set_property()` calls (renamed from `add_property()`, removed type string arg)
+- Register all custom resource property definitions via `property_definitions.define_resource_property()`
+- Include action types in access policy collection loop
+
+### Version 1.1.0 (2026-04-30)
+
+- Switch to Foundry v2 API for users, groups, memberships, and filesystem traversal
+- Add full group membership collection including nested groups
+- Add recursive filesystem traversal (spaces → projects → datasets)
+- Add per-resource role grant collection via `/api/v2/filesystem/resources/{rid}/roles`
+- Add file-only rotating log handler (hourly, 24 files kept)
+
+### Version 1.0.0 (2026-04-27)
 
 - Initial release
 - Support for Palantir Foundry workspaces, projects, and datasets
 - Integration with Veza OAA API
 - Automated installation script
-- Comprehensive documentation
 
 ---
 
