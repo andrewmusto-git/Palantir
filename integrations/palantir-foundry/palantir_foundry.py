@@ -2,8 +2,14 @@
 """
 Palantir Foundry to Veza OAA Integration Script
 
-Collects resource definitions, datasets, workspaces, and access control information
+Collects identity, group, project, and file access control information
 from Palantir Foundry and pushes to Veza via the Open Authorization API (OAA).
+
+Data model:
+  User -> Groups (including nested groups) -> Permissions -> Project (Resource)
+                                                                    |
+                                                       Files/Datasets (Sub-resources)
+                                                       [inherit permissions from Project]
 """
 
 import argparse
@@ -338,9 +344,16 @@ def build_oaa_payload(
 ) -> CustomApplication:
     """Build OAA CustomApplication from Palantir Foundry data.
 
-    Permission model: User > Group > Permissions > Application
-      - Users are members of Groups
-      - Groups hold Permissions on Application resources
+    Permission model:
+      User -> Groups (including nested groups) -> Permissions -> Project (Resource)
+                                                                        |
+                                                           Files/Datasets (Sub-resources)
+                                                           [inherit permissions from Project]
+
+      - Users are members of Groups (direct membership and via nested group hierarchy)
+      - Groups hold Permissions on Project resources
+      - Files and Datasets within a Project are modelled as sub-resources and inherit
+        permissions from their parent Project (permission inheritance block)
       - Direct user-to-resource grants are not modelled; all access flows via group membership
     """
     app = CustomApplication(
@@ -430,20 +443,9 @@ def build_oaa_payload(
                 membership_count += 1
     log.info("Linked %d group memberships", membership_count)
 
-    # ── Workspaces ────────────────────────────────────────────────────────────
-    log.info("Processing workspaces...")
-    for workspace in foundry_data.get("workspaces", []):
-        rid = workspace.get("rid") or workspace.get("id")
-        if not rid:
-            log.warning("Workspace missing rid/id — skipping")
-            continue
-        name = workspace.get("displayName") or workspace.get("name") or rid
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Workspace")
-        resource_lookup[rid] = resource
-        _apply_resource_properties(resource, workspace)
-        log.debug("Added workspace: %s (%s)", name, rid)
-
-    # ── Projects ──────────────────────────────────────────────────────────────
+    # ── Projects (primary Resources) ──────────────────────────────────────────
+    # Projects are the top-level resource in the permission model.
+    # All group permissions are granted at the Project level.
     log.info("Processing projects...")
     for project in foundry_data.get("projects", []):
         rid = project.get("rid") or project.get("id")
@@ -456,43 +458,91 @@ def build_oaa_payload(
         _apply_resource_properties(resource, project)
         log.debug("Added project: %s (%s)", name, rid)
 
-    # ── Datasets ──────────────────────────────────────────────────────────────
-    log.info("Processing datasets...")
+    # ── Datasets (sub-resources of their parent Project) ──────────────────────
+    # Datasets are modelled as sub-resources of their parent Project.  They inherit
+    # all permissions granted on the Project (permission inheritance block).
+    log.info("Processing datasets as sub-resources of their parent project...")
+    dataset_sub_count = 0
+    dataset_orphan_count = 0
     for dataset in foundry_data.get("datasets", []):
         rid = dataset.get("rid") or dataset.get("id")
         if not rid:
             log.warning("Dataset missing rid/id — skipping")
             continue
         name = dataset.get("displayName") or dataset.get("name") or rid
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Dataset")
-        resource_lookup[rid] = resource
-        _apply_resource_properties(resource, dataset)
-        if row_count := dataset.get("rowCount"):
-            resource.add_property("row_count", str(row_count), "str")
-        log.debug("Added dataset: %s (%s)", name, rid)
+        project_rid = dataset.get("projectRid")
+        parent_project = resource_lookup.get(project_rid) if project_rid else None
 
-    # ── Generic resources ─────────────────────────────────────────────────────
-    log.info("Processing resources...")
+        if parent_project is not None:
+            # Sub-resource: inherits permissions from parent Project
+            sub_resource = parent_project.add_sub_resource(
+                sub_resource_id=rid,
+                sub_resource_name=name,
+                sub_resource_type="Dataset",
+            )
+            resource_lookup[rid] = sub_resource
+            dataset_sub_count += 1
+        else:
+            # Parent project not found — fall back to top-level resource
+            resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Dataset")
+            resource_lookup[rid] = resource
+            dataset_orphan_count += 1
+            log.debug("Dataset %s has no parent project (projectRid=%s)", rid, project_rid)
+        log.debug("Added dataset: %s (%s)", name, rid)
+    log.info(
+        "Processed %d datasets: %d as sub-resources, %d as top-level (no parent project found)",
+        dataset_sub_count + dataset_orphan_count, dataset_sub_count, dataset_orphan_count,
+    )
+
+    # ── Files / other resources (sub-resources of their parent Project) ───────
+    # Non-dataset files are modelled as sub-resources of their parent Project,
+    # inheriting permissions from the Project (permission inheritance block).
+    log.info("Processing files/resources as sub-resources of their parent project...")
+    file_sub_count = 0
+    file_orphan_count = 0
     for res in foundry_data.get("resources", []):
         rid = res.get("rid") or res.get("id")
         if not rid:
             log.warning("Resource missing rid/id — skipping")
             continue
         name = res.get("displayName") or res.get("name") or rid
-        rtype = res.get("type", "Resource")
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type=rtype)
-        resource_lookup[rid] = resource
-        _apply_resource_properties(resource, res)
-        log.debug("Added resource: %s (%s)", name, rid)
+        rtype = res.get("type", "File")
+        project_rid = res.get("projectRid")
+        parent_project = resource_lookup.get(project_rid) if project_rid else None
+
+        if parent_project is not None:
+            # Sub-resource: inherits permissions from parent Project
+            sub_resource = parent_project.add_sub_resource(
+                sub_resource_id=rid,
+                sub_resource_name=name,
+                sub_resource_type=rtype,
+            )
+            resource_lookup[rid] = sub_resource
+            file_sub_count += 1
+        else:
+            # Parent project not found — fall back to top-level resource
+            resource = app.add_resource(resource_id=rid, resource_name=name, resource_type=rtype)
+            resource_lookup[rid] = resource
+            file_orphan_count += 1
+        log.debug("Added file/resource: %s (%s)", name, rid)
+    log.info(
+        "Processed %d files/resources: %d as sub-resources, %d as top-level (no parent project found)",
+        file_sub_count + file_orphan_count, file_sub_count, file_orphan_count,
+    )
 
     # ── Access policies ───────────────────────────────────────────────────────
     # v2 filesystem/resources/{rid}/roles returns ResourceRole objects:
     #   {resourceRolePrincipal: {type, principalId, principalType}, roleId}
     #
-    # Permission model: User > Group > Permissions > Application
-    # Only GROUP-level grants are applied to resources. Direct USER grants are
+    # Permission model: User > Groups (nested) > Permissions > Project (Resource)
+    #                                                                   |
+    #                                                      Files/Datasets (Sub-resources)
+    #                                                      [inherit permissions from Project]
+    #
+    # Only GROUP-level grants are applied to Project resources.  Direct USER grants are
     # intentionally skipped — users gain access exclusively through group membership.
-    log.info("Processing access policies (group-based grants only)...")
+    # Sub-resources (Datasets, Files) inherit all Project-level permissions automatically.
+    log.info("Processing access policies (group-based grants on projects only)...")
     total_permissions = 0
     skipped_direct_user_grants = 0
     for resource_id, policies in foundry_data.get("access_policies", {}).items():
@@ -539,12 +589,11 @@ def build_oaa_payload(
         )
 
     log.info(
-        "Payload: %d workspaces, %d projects, %d datasets, %d resources, "
-        "%d users, %d groups, %d memberships, %d permissions",
-        len(foundry_data.get("workspaces", [])),
+        "Payload: %d projects (resources), %d datasets (%d sub-resources), "
+        "%d files (%d sub-resources), %d users, %d groups, %d memberships, %d permissions",
         len(foundry_data.get("projects", [])),
-        len(foundry_data.get("datasets", [])),
-        len(foundry_data.get("resources", [])),
+        dataset_sub_count + dataset_orphan_count, dataset_sub_count,
+        file_sub_count + file_orphan_count, file_sub_count,
         len(user_lookup),
         len(group_lookup),
         membership_count,
@@ -679,10 +728,11 @@ def main() -> None:
                 group_memberships.append({"group_id": gid, **member})
     log.info("Retrieved %d group membership entries", len(group_memberships))
 
-    # Fetch access policies for every discovered entity
+    # Fetch access policies for projects, datasets, and files (not workspaces —
+    # workspaces are discovery containers only, not modelled as resources)
     print("[3/5] Fetching access policies...")
     access_policies: Dict[str, List] = {}
-    for entity in workspaces + projects + datasets + resources:
+    for entity in projects + datasets + resources:
         rid = entity.get("rid") or entity.get("id")
         if rid:
             policies = foundry.get_access_policies(rid)

@@ -142,7 +142,7 @@ python3 -m venv "${SCRIPTS_DIR}/venv"
 
 info "Installing Python dependencies..."
 "${SCRIPTS_DIR}/venv/bin/pip" install --quiet --upgrade pip
-"${SCRIPTS_DIR}/venv/bin/pip" install --quiet -r "${SCRIPTS_DIR}/requirements.txt"
+"${SCRIPTS_DIR}/venv/bin/pip" install --quiet --upgrade -r "${SCRIPTS_DIR}/requirements.txt"
 ok "Dependencies installed"
 
 # ---------------------------------------------------------------------------
