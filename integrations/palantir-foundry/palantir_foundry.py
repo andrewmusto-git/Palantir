@@ -2,14 +2,8 @@
 """
 Palantir Foundry to Veza OAA Integration Script
 
-Collects identity, group, project, and file access control information
+Collects resource definitions, datasets, workspaces, and access control information
 from Palantir Foundry and pushes to Veza via the Open Authorization API (OAA).
-
-Data model:
-  User -> Groups (including nested groups) -> Permissions -> Project (Resource)
-                                                                    |
-                                                       Files/Datasets (Sub-resources)
-                                                       [inherit permissions from Project]
 """
 
 import argparse
@@ -22,11 +16,9 @@ from logging.handlers import TimedRotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 
 import requests
-import urllib3
 from dotenv import load_dotenv
 from oaaclient.client import OAAClient, OAAClientError
 from oaaclient.templates import CustomApplication, OAAPermission
-from requests.adapters import HTTPAdapter
 
 log = logging.getLogger(__name__)
 
@@ -53,9 +45,16 @@ def _setup_logging(log_level: str = "INFO") -> None:
         datefmt="%Y-%m-%dT%H:%M:%S",
     ))
 
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(logging.Formatter(
+        fmt="%(asctime)s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    ))
+
     root = logging.getLogger()
     root.setLevel(getattr(logging, log_level.upper(), logging.INFO))
     root.addHandler(handler)
+    root.addHandler(console_handler)
 
 
 class PalantirFoundryClient:
@@ -76,31 +75,13 @@ class PalantirFoundryClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
-        self.session = self._build_session()
         self._filesystem_cache: Optional[Tuple[List, List, List]] = None
         self._test_connection()
-
-    def _build_session(self) -> requests.Session:
-        """Create a requests session with retries for transient HTTP failures."""
-        session = requests.Session()
-        retry = urllib3.util.retry.Retry(
-            total=5,
-            connect=3,
-            read=3,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(max_retries=retry)
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-        return session
 
     def _test_connection(self) -> None:
         """Verify the API token is accepted by Palantir Foundry."""
         try:
-            response = self.session.get(
+            response = requests.get(
                 f"{self.base_url}/api/v2/admin/users",
                 headers=self.headers,
                 params={"pageSize": 1},
@@ -119,7 +100,7 @@ class PalantirFoundryClient:
         # urljoin requires the base to end with '/' and the path to have no leading '/'
         url = self.base_url.rstrip("/") + "/" + endpoint.lstrip("/")
         try:
-            response = self.session.request(
+            response = requests.request(
                 method,
                 url,
                 headers=self.headers,
@@ -177,7 +158,7 @@ class PalantirFoundryClient:
         """Fetch all Spaces from the Palantir Foundry v2 Filesystem API."""
         try:
             return self.get_paginated_results(
-                "/api/v2/filesystem/spaces", items_key="data"
+                "/api/v2/filesystem/spaces", items_key="data", params={"preview": "true"}
             )
         except requests.RequestException:
             log.error("Failed to fetch spaces")
@@ -189,6 +170,7 @@ class PalantirFoundryClient:
             return self.get_paginated_results(
                 f"/api/v2/filesystem/folders/{folder_rid}/children",
                 items_key="data",
+                params={"preview": "true"},
             )
         except requests.RequestException as e:
             log.debug("Could not list children of %s: %s", folder_rid, e)
@@ -329,35 +311,63 @@ class PalantirFoundryClient:
             log.warning("Could not fetch admin roles (role names will be inferred from ID): %s", e)
             return {}
 
+    def get_ontology_programs(self) -> List[Dict]:
+        """Fetch AIP programs and action types from the Palantir Foundry Ontology API."""
+        programs: List[Dict] = []
+        try:
+            ontologies = self.get_paginated_results("/api/v2/ontologies", items_key="data")
+            for ontology in ontologies:
+                ont_rid = ontology.get("rid") or ontology.get("ontologyRid")
+                if not ont_rid:
+                    continue
+                try:
+                    actions = self.get_paginated_results(
+                        f"/api/v2/ontologies/{ont_rid}/actionTypes",
+                        items_key="data",
+                    )
+                    for action in actions:
+                        action.setdefault("type", "AIP_PROGRAM")
+                        action["_ontologyRid"] = ont_rid
+                    programs.extend(actions)
+                except requests.RequestException as e:
+                    log.debug("Could not fetch action types for ontology %s: %s", ont_rid, e)
+        except requests.RequestException as e:
+            log.warning("Could not fetch ontologies (AIP programs skipped): %s", e)
+        log.info("Retrieved %d ontology programs", len(programs))
+        return programs
+
 
 VEZA_MAX_FIELD_LEN = 512
 
 
 def _apply_resource_properties(resource, data: Dict) -> None:
-    """Set common metadata properties on an OAA resource object."""
+    """Set description on an OAA resource object if present in the source data."""
     if description := data.get("description"):
-        resource.add_property("description", description[:VEZA_MAX_FIELD_LEN], "str")
-    if owner := data.get("owner"):
-        resource.add_property("owner", owner, "str")
-    if created := data.get("createdAt") or data.get("createdTime"):
-        resource.add_property("created_at", str(created), "str")
-    if rtype := data.get("type"):
-        resource.add_property("resource_type", rtype, "str")
+        resource.description = description[:VEZA_MAX_FIELD_LEN]
 
 
-def _map_role_to_oaa_permission(role_id: str, role_display_name: str = "") -> str:
-    """Map a Foundry role (by UUID + display name) to an OAA permission name."""
+def _map_role_to_oaa_permissions(role_id: str, role_display_name: str = "") -> List[str]:
+    """Map a Foundry role ID (e.g. compass:edit, marketplace-installation:manage) to OAA permission names."""
     name = role_display_name.lower() if role_display_name else role_id.lower()
+    if any(kw in name for kw in ("manage", "owner", "administer", "admin")):
+        return ["Manage Access"]
+    if any(kw in name for kw in ("edit", "contributor", "write", "build")):
+        return ["Edit Logic", "Run Model", "View Data"]
+    if any(kw in name for kw in ("view", "viewer", "read", "discover")):
+        return ["View Data"]
+    return ["View Data"]
+
+
+def _role_to_action_permissions(role_display_name: str) -> List[str]:
+    """Return action-item permission names granted by a Foundry role."""
+    name = role_display_name.lower()
     if any(kw in name for kw in ("owner", "administer", "admin")):
-        return "owner"
+        return ["Edit Logic", "Run Model", "View Data", "Manage Access"]
     if any(kw in name for kw in ("editor", "write", "edit")):
-        return "editor"
-    if any(kw in name for kw in ("discover",)):
-        return "discoverer"
-    if any(kw in name for kw in ("viewer", "view", "read")):
-        return "viewer"
-    # Default to least-privilege when the role name is unrecognised
-    return "viewer"
+        return ["Edit Logic", "Run Model", "View Data"]
+    if any(kw in name for kw in ("viewer", "view", "read", "discover")):
+        return ["View Data"]
+    return ["View Data"]
 
 
 def build_oaa_payload(
@@ -367,49 +377,47 @@ def build_oaa_payload(
 ) -> CustomApplication:
     """Build OAA CustomApplication from Palantir Foundry data.
 
-    Permission model:
-      User -> Groups (including nested groups) -> Permissions -> Project (Resource)
-                                                                        |
-                                                           Files/Datasets (Sub-resources)
-                                                           [inherit permissions from Project]
-
-      - Users are members of Groups (direct membership and via nested group hierarchy)
-      - Groups hold Permissions on Project resources
-      - Files and Datasets within a Project are modelled as sub-resources and inherit
-        permissions from their parent Project (permission inheritance block)
-      - Direct user-to-resource grants are not modelled; all access flows via group membership
+    Permission model: User > Group > Role > Action Permissions > Resource
+      - Users are members of Groups
+      - Groups are assigned Roles on Project resources
+      - Roles define fine-grained Action Permissions (Edit Logic, Run Model, View Data)
+      - Projects contain Programs and Datasets as sub-resources
+      - Direct user-to-resource grants are intentionally skipped
     """
     app = CustomApplication(
         name=datasource_name,
         application_type=provider_name,
     )
 
-    app.add_custom_permission("discoverer", [OAAPermission.MetadataRead])
-    app.add_custom_permission("viewer", [OAAPermission.DataRead, OAAPermission.MetadataRead])
-    app.add_custom_permission("editor", [OAAPermission.DataRead, OAAPermission.DataWrite, OAAPermission.MetadataRead])
-    app.add_custom_permission(
-        "owner",
-        [
-            OAAPermission.DataRead,
-            OAAPermission.DataWrite,
-            OAAPermission.MetadataRead,
-            OAAPermission.MetadataWrite,
-            OAAPermission.NonData,
-        ],
-    )
-    app.add_custom_permission(
-        "admin",
-        [
-            OAAPermission.DataRead,
-            OAAPermission.DataWrite,
-            OAAPermission.MetadataRead,
-            OAAPermission.MetadataWrite,
-        ],
-    )
+    # ── Action-level custom permissions ───────────────────────────────────────
+    app.add_custom_permission("View Data",     [OAAPermission.DataRead, OAAPermission.MetadataRead])
+    app.add_custom_permission("Edit Logic",    [OAAPermission.DataWrite, OAAPermission.MetadataWrite])
+    app.add_custom_permission("Run Model",     [OAAPermission.NonData])
+    app.add_custom_permission("Manage Access", [
+        OAAPermission.DataRead, OAAPermission.DataWrite,
+        OAAPermission.MetadataRead, OAAPermission.MetadataWrite, OAAPermission.NonData,
+    ])
 
     resource_lookup: Dict[str, object] = {}
     user_lookup: Dict[str, object] = {}
     group_lookup: Dict[str, object] = {}
+    project_resource_lookup: Dict[str, object] = {}
+
+    # ── Local roles ───────────────────────────────────────────────────────────
+    # Each Foundry role becomes an OAA local role that carries action permissions.
+    # role_name_lookup: Foundry roleId → OAA role display name
+    log.info("Creating local roles from Foundry role definitions...")
+    role_name_lookup: Dict[str, str] = {}
+    seen_role_names: set = set()
+    for role_id, role_display in foundry_data.get("role_lookup", {}).items():
+        role_name = role_display or role_id
+        if role_name not in seen_role_names:
+            action_perms = _role_to_action_permissions(role_name)
+            app.add_local_role(role_name, permissions=action_perms)
+            seen_role_names.add(role_name)
+            log.debug("Added role: %s → %s", role_name, action_perms)
+        role_name_lookup[role_id] = role_name
+    log.info("Created %d local roles", len(seen_role_names))
 
     # ── Users ─────────────────────────────────────────────────────────────────
     log.info("Processing users...")
@@ -423,8 +431,10 @@ def build_oaa_payload(
         email = user.get("email")
         if email:
             oaa_user.email = email
+            oaa_user.add_identity(email)
         elif "@" in username:
             oaa_user.email = username
+            oaa_user.add_identity(username)
         user_lookup[uid] = oaa_user
         log.debug("Added user: %s (%s)", username, uid)
 
@@ -456,19 +466,29 @@ def build_oaa_payload(
         if m_type == "USER":
             oaa_user = user_lookup.get(m_id)
             if oaa_user:
-                oaa_user.add_group(oaa_group)
+                oaa_user.add_group(group_id)
                 membership_count += 1
         elif m_type in ("GROUP", "TEAM"):
-            # nested group — ensure the child group exists then add it as a member
             child_group = group_lookup.get(m_id)
             if child_group:
-                child_group.add_group(oaa_group)
+                child_group.add_group(group_id)
                 membership_count += 1
     log.info("Linked %d group memberships", membership_count)
 
-    # ── Projects (primary Resources) ──────────────────────────────────────────
-    # Projects are the top-level resource in the permission model.
-    # All group permissions are granted at the Project level.
+    # ── Workspaces (top-level resources) ──────────────────────────────────────
+    log.info("Processing workspaces...")
+    for workspace in foundry_data.get("workspaces", []):
+        rid = workspace.get("rid") or workspace.get("id")
+        if not rid:
+            log.warning("Workspace missing rid/id — skipping")
+            continue
+        name = (workspace.get("displayName") or workspace.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
+        resource = app.add_resource(name=name, resource_type="Workspace", unique_id=rid)
+        resource_lookup[rid] = resource
+        _apply_resource_properties(resource, workspace)
+        log.debug("Added workspace: %s (%s)", name, rid)
+
+    # ── Projects (top-level resources, parent of Programs and Datasets) ────────
     log.info("Processing projects...")
     for project in foundry_data.get("projects", []):
         rid = project.get("rid") or project.get("id")
@@ -476,117 +496,92 @@ def build_oaa_payload(
             log.warning("Project missing rid/id — skipping")
             continue
         name = (project.get("displayName") or project.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
-        resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Project")
+        resource = app.add_resource(name=name, resource_type="Project", unique_id=rid)
+        project_resource_lookup[rid] = resource
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, project)
         log.debug("Added project: %s (%s)", name, rid)
 
-    # ── Datasets (sub-resources of their parent Project) ──────────────────────
-    # Datasets are modelled only as sub-resources of their parent Project.
-    # If no parent Project can be resolved, the dataset is skipped to preserve
-    # the strict permission path: User -> Group -> Project -> Sub-resource inheritance.
-    log.info("Processing datasets as sub-resources of their parent project...")
-    dataset_sub_count = 0
-    dataset_skipped_count = 0
+    # ── Datasets (sub-resources under their parent project) ───────────────────
+    log.info("Processing datasets...")
     for dataset in foundry_data.get("datasets", []):
         rid = dataset.get("rid") or dataset.get("id")
         if not rid:
             log.warning("Dataset missing rid/id — skipping")
             continue
         name = (dataset.get("displayName") or dataset.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
-        project_rid = dataset.get("projectRid")
-        parent_project = resource_lookup.get(project_rid) if project_rid else None
-
-        if parent_project is not None:
-            # Sub-resource: inherits permissions from parent Project
-            sub_resource = parent_project.add_sub_resource(
-                sub_resource_id=rid,
-                sub_resource_name=name,
-                sub_resource_type="Dataset",
-            )
-            resource_lookup[rid] = sub_resource
-            dataset_sub_count += 1
+        parent_rid = dataset.get("projectRid")
+        parent_project = project_resource_lookup.get(parent_rid) if parent_rid else None
+        if parent_project:
+            sub = parent_project.add_sub_resource(name=name, resource_type="Dataset", unique_id=rid)
+            resource_lookup[rid] = sub
+            if row_count := dataset.get("rowCount"):
+                sub.add_property("row_count", str(row_count), "str")
         else:
-            dataset_skipped_count += 1
-            log.debug(
-                "Skipping dataset %s because no parent project was found (projectRid=%s)",
-                rid,
-                project_rid,
-            )
+            resource = app.add_resource(name=name, resource_type="Dataset", unique_id=rid)
+            resource_lookup[rid] = resource
+            if row_count := dataset.get("rowCount"):
+                resource.add_property("row_count", str(row_count), "str")
         log.debug("Added dataset: %s (%s)", name, rid)
-    log.info(
-        "Processed %d datasets: %d as sub-resources, %d skipped (no parent project found)",
-        dataset_sub_count + dataset_skipped_count,
-        dataset_sub_count,
-        dataset_skipped_count,
-    )
 
-    # ── Files / other resources (sub-resources of their parent Project) ───────
-    # Non-dataset files are modelled only as sub-resources of their parent Project.
-    # If no parent Project can be resolved, the file/resource is skipped.
-    log.info("Processing files/resources as sub-resources of their parent project...")
-    file_sub_count = 0
-    file_skipped_count = 0
+    # ── Programs / AIP models (sub-resources under their parent project) ───────
+    log.info("Processing ontology programs...")
+    for program in foundry_data.get("programs", []):
+        rid = program.get("rid") or program.get("id") or program.get("apiName")
+        if not rid:
+            log.warning("Program missing id — skipping")
+            continue
+        name = (program.get("displayName") or program.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
+        parent_rid = program.get("projectRid") or program.get("_ontologyRid")
+        parent_project = project_resource_lookup.get(parent_rid) if parent_rid else None
+        if parent_project:
+            sub = parent_project.add_sub_resource(name=name, resource_type="Program", unique_id=rid)
+            resource_lookup[rid] = sub
+        else:
+            resource = app.add_resource(name=name, resource_type="Program", unique_id=rid)
+            resource_lookup[rid] = resource
+        log.debug("Added program: %s (%s)", name, rid)
+
+    # ── Generic resources (sub-resource if they have projectRid, else top-level)
+    log.info("Processing resources...")
     for res in foundry_data.get("resources", []):
         rid = res.get("rid") or res.get("id")
         if not rid:
             log.warning("Resource missing rid/id — skipping")
             continue
+        # Skip action types already handled by the programs loop
+        if rid in resource_lookup:
+            log.debug("Skipping resource %s — already added as a program", rid)
+            continue
         name = (res.get("displayName") or res.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
-        rtype = res.get("type", "File")
-        project_rid = res.get("projectRid")
-        parent_project = resource_lookup.get(project_rid) if project_rid else None
-
-        if parent_project is not None:
-            # Sub-resource: inherits permissions from parent Project
-            sub_resource = parent_project.add_sub_resource(
-                sub_resource_id=rid,
-                sub_resource_name=name,
-                sub_resource_type=rtype,
-            )
-            resource_lookup[rid] = sub_resource
-            file_sub_count += 1
+        rtype = res.get("type", "Resource")
+        rtype_label = "Program" if any(
+            kw in rtype.upper() for kw in ("FUNCTION", "MODEL", "PIPELINE", "PROGRAM", "AIP")
+        ) else rtype
+        parent_rid = res.get("projectRid")
+        parent_project = project_resource_lookup.get(parent_rid) if parent_rid else None
+        if parent_project:
+            sub = parent_project.add_sub_resource(name=name, resource_type=rtype_label, unique_id=rid)
+            resource_lookup[rid] = sub
+            _apply_resource_properties(sub, res)
         else:
-            file_skipped_count += 1
-            log.debug(
-                "Skipping file/resource %s because no parent project was found (projectRid=%s)",
-                rid,
-                project_rid,
-            )
-        log.debug("Added file/resource: %s (%s)", name, rid)
-    log.info(
-        "Processed %d files/resources: %d as sub-resources, %d skipped (no parent project found)",
-        file_sub_count + file_skipped_count,
-        file_sub_count,
-        file_skipped_count,
-    )
+            resource = app.add_resource(name=name, resource_type=rtype_label, unique_id=rid)
+            resource_lookup[rid] = resource
+            _apply_resource_properties(resource, res)
+        log.debug("Added resource: %s (%s)", name, rid)
 
     # ── Access policies ───────────────────────────────────────────────────────
     # v2 filesystem/resources/{rid}/roles returns ResourceRole objects:
     #   {resourceRolePrincipal: {type, principalId, principalType}, roleId}
     #
-    # Permission model: User > Groups (nested) > Permissions > Project (Resource)
-    #                                                                   |
-    #                                                      Files/Datasets (Sub-resources)
-    #                                                      [inherit permissions from Project]
-    #
-    # Only GROUP-level grants are applied to Project resources.  Direct USER grants are
-    # intentionally skipped — users gain access exclusively through group membership.
-    # Sub-resources (Datasets, Files) inherit all Project-level permissions automatically.
-    log.info("Processing access policies (group-based grants on projects only)...")
+    # Permission model: User > Group > Role > Action Permissions > Project
+    # Groups are assigned named Roles on Project resources; Roles carry the
+    # action permissions ("Edit Logic", "Run Model", "View Data").
+    # Direct USER grants are intentionally skipped — access flows via group membership.
+    log.info("Processing access policies (group → role → resource)...")
     total_permissions = 0
     skipped_direct_user_grants = 0
-    skipped_non_project_grants = 0
-    project_resource_ids = {
-        p.get("rid") or p.get("id")
-        for p in foundry_data.get("projects", [])
-        if (p.get("rid") or p.get("id"))
-    }
     for resource_id, policies in foundry_data.get("access_policies", {}).items():
-        if resource_id not in project_resource_ids:
-            # Enforce project-centric permission model.
-            skipped_non_project_grants += len(policies)
-            continue
         oaa_resource = resource_lookup.get(resource_id)
         if oaa_resource is None:
             continue
@@ -594,33 +589,39 @@ def build_oaa_payload(
             rr_principal = policy.get("resourceRolePrincipal", {})
             principal_type_discriminator = rr_principal.get("type", "")
             role_id = policy.get("roleId", "")
-            # Map Foundry roleId (UUID) to an OAA permission name by
-            # looking up the role in the role_lookup dict (fetched from admin API),
-            # then matching keywords; default to "viewer" (least privilege).
-            role_display = foundry_data.get("role_lookup", {}).get(role_id, "")
-            role = _map_role_to_oaa_permission(role_id, role_display)
 
             if principal_type_discriminator == "everyone":
-                # Skip platform-wide "everyone" grants — not meaningful per-principal
                 continue
 
             p_id = rr_principal.get("principalId")
-            p_type = rr_principal.get("principalType", "").upper()  # USER or GROUP
+            p_type = rr_principal.get("principalType", "").upper()
             if not p_id:
                 continue
 
             if p_type == "USER":
-                # Permission model is User > Group > Permissions > Application.
-                # Direct user grants are skipped; access flows via group membership only.
-                log.debug(
-                    "Skipping direct user grant: user %s, role %s, resource %s",
-                    p_id, role, resource_id,
-                )
-                skipped_direct_user_grants += 1
+                oaa_user = user_lookup.get(p_id)
+                if oaa_user:
+                    role_display = foundry_data.get("role_lookup", {}).get(role_id, "")
+                    for perm in _map_role_to_oaa_permissions(role_id, role_display):
+                        oaa_user.add_permission(perm, resources=[oaa_resource])
+                    total_permissions += 1
+                else:
+                    log.debug(
+                        "Skipping direct user grant for unknown user %s, role %s, resource %s",
+                        p_id, role_id, resource_id,
+                    )
+                    skipped_direct_user_grants += 1
             elif p_type == "GROUP":
                 if p_id not in group_lookup:
                     group_lookup[p_id] = app.add_local_group(p_id, unique_id=p_id)
-                group_lookup[p_id].add_permission(role, resources=[oaa_resource])
+                oaa_group = group_lookup[p_id]
+                role_name = role_name_lookup.get(role_id)
+                if role_name:
+                    oaa_group.add_role(role_name, resources=[oaa_resource])
+                else:
+                    role_display = foundry_data.get("role_lookup", {}).get(role_id, "")
+                    for perm in _map_role_to_oaa_permissions(role_id, role_display):
+                        oaa_group.add_permission(perm, resources=[oaa_resource])
                 total_permissions += 1
 
     if skipped_direct_user_grants:
@@ -628,22 +629,18 @@ def build_oaa_payload(
             "Skipped %d direct user permission grant(s) — access flows via group membership",
             skipped_direct_user_grants,
         )
-    if skipped_non_project_grants:
-        log.info(
-            "Skipped %d non-project grant(s) — permissions are modelled only on Projects",
-            skipped_non_project_grants,
-        )
 
     log.info(
-        "Payload: %d projects (resources), %d datasets (%d sub-resources), "
-        "%d files (%d sub-resources), %d users, %d groups, %d memberships, %d permissions",
+        "Payload: %d workspaces, %d projects, %d datasets, %d programs, %d resources, "
+        "%d users, %d groups, %d roles, %d memberships, %d permissions",
+        len(foundry_data.get("workspaces", [])),
         len(foundry_data.get("projects", [])),
-        dataset_sub_count + dataset_skipped_count,
-        dataset_sub_count,
-        file_sub_count + file_skipped_count,
-        file_sub_count,
+        len(foundry_data.get("datasets", [])),
+        len(foundry_data.get("programs", [])),
+        len(foundry_data.get("resources", [])),
         len(user_lookup),
         len(group_lookup),
+        len(seen_role_names),
         membership_count,
         total_permissions,
     )
@@ -761,10 +758,31 @@ def main() -> None:
     projects = foundry.get_projects()
     datasets = foundry.get_datasets()
     resources = foundry.get_resources()
+    programs = foundry.get_ontology_programs()
     users = foundry.get_users()
     groups = foundry.get_groups()
     role_lookup = foundry.get_admin_roles()
     log.info("Fetched %d role definitions", len(role_lookup))
+
+    # Link each ontology action type back to its parent project.
+    # The filesystem traversal captures ACTIONS_ACTIONTYPE resources with a
+    # projectRid; we use that to set program["projectRid"] so build_oaa_payload
+    # can nest programs under the correct project resource.
+    action_type_project: Dict[str, str] = {
+        res["rid"]: res["projectRid"]
+        for res in resources
+        if res.get("rid", "").startswith("ri.actions.") and res.get("projectRid")
+    }
+    for program in programs:
+        prog_rid = program.get("rid") or program.get("id") or program.get("apiName")
+        if prog_rid and prog_rid in action_type_project and "projectRid" not in program:
+            program["projectRid"] = action_type_project[prog_rid]
+            log.debug("Linked program %s to project %s", prog_rid, action_type_project[prog_rid])
+    log.info(
+        "Linked %d of %d programs to parent projects via filesystem traversal",
+        sum(1 for p in programs if p.get("projectRid")),
+        len(programs),
+    )
 
     # Fetch group memberships
     log.info("Fetching group memberships...")
@@ -776,22 +794,41 @@ def main() -> None:
                 group_memberships.append({"group_id": gid, **member})
     log.info("Retrieved %d group membership entries", len(group_memberships))
 
-    # Fetch access policies for projects only.
-    # Datasets/files inherit from Project via sub-resource inheritance.
+    # Fetch access policies for every discovered entity
     print("[3/5] Fetching access policies...")
     access_policies: Dict[str, List] = {}
-    for entity in projects:
+    for entity in workspaces + projects + datasets + resources:
         rid = entity.get("rid") or entity.get("id")
         if rid:
             policies = foundry.get_access_policies(rid)
             if policies:
                 access_policies[rid] = policies
 
+    # Programs (ontology action types) need their own ACL fetch.
+    # Palantir may grant access at the action-type level directly, or inherit
+    # from the parent ontology. We try direct first; if empty we fall back to
+    # the ontology-level grant so group→role→program links are populated.
+    _ontology_policy_cache: Dict[str, List] = {}
+    for program in programs:
+        prog_rid = program.get("rid") or program.get("id") or program.get("apiName")
+        ont_rid = program.get("_ontologyRid")
+        if not prog_rid:
+            continue
+        policies = foundry.get_access_policies(prog_rid)
+        if policies:
+            access_policies[prog_rid] = policies
+        elif ont_rid:
+            if ont_rid not in _ontology_policy_cache:
+                _ontology_policy_cache[ont_rid] = foundry.get_access_policies(ont_rid)
+            if _ontology_policy_cache[ont_rid]:
+                access_policies[prog_rid] = _ontology_policy_cache[ont_rid]
+
     foundry_data = {
         "workspaces": workspaces,
         "projects": projects,
         "datasets": datasets,
         "resources": resources,
+        "programs": programs,
         "users": users,
         "groups": groups,
         "group_memberships": group_memberships,
