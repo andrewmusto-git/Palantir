@@ -330,10 +330,13 @@ class PalantirFoundryClient:
             return {}
 
 
+VEZA_MAX_FIELD_LEN = 512
+
+
 def _apply_resource_properties(resource, data: Dict) -> None:
     """Set common metadata properties on an OAA resource object."""
     if description := data.get("description"):
-        resource.add_property("description", description, "str")
+        resource.add_property("description", description[:VEZA_MAX_FIELD_LEN], "str")
     if owner := data.get("owner"):
         resource.add_property("owner", owner, "str")
     if created := data.get("createdAt") or data.get("createdTime"):
@@ -472,7 +475,7 @@ def build_oaa_payload(
         if not rid:
             log.warning("Project missing rid/id — skipping")
             continue
-        name = project.get("displayName") or project.get("name") or rid
+        name = (project.get("displayName") or project.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
         resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Project")
         resource_lookup[rid] = resource
         _apply_resource_properties(resource, project)
@@ -490,7 +493,7 @@ def build_oaa_payload(
         if not rid:
             log.warning("Dataset missing rid/id — skipping")
             continue
-        name = dataset.get("displayName") or dataset.get("name") or rid
+        name = (dataset.get("displayName") or dataset.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
         project_rid = dataset.get("projectRid")
         parent_project = resource_lookup.get(project_rid) if project_rid else None
 
@@ -529,7 +532,7 @@ def build_oaa_payload(
         if not rid:
             log.warning("Resource missing rid/id — skipping")
             continue
-        name = res.get("displayName") or res.get("name") or rid
+        name = (res.get("displayName") or res.get("name") or rid)[:VEZA_MAX_FIELD_LEN]
         rtype = res.get("type", "File")
         project_rid = res.get("projectRid")
         parent_project = resource_lookup.get(project_rid) if project_rid else None
