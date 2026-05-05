@@ -22,9 +22,11 @@ from logging.handlers import TimedRotatingFileHandler
 from typing import Dict, List, Optional, Tuple
 
 import requests
+import urllib3
 from dotenv import load_dotenv
 from oaaclient.client import OAAClient, OAAClientError
 from oaaclient.templates import CustomApplication, OAAPermission
+from requests.adapters import HTTPAdapter
 
 log = logging.getLogger(__name__)
 
@@ -74,13 +76,31 @@ class PalantirFoundryClient:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        self.session = self._build_session()
         self._filesystem_cache: Optional[Tuple[List, List, List]] = None
         self._test_connection()
+
+    def _build_session(self) -> requests.Session:
+        """Create a requests session with retries for transient HTTP failures."""
+        session = requests.Session()
+        retry = urllib3.util.retry.Retry(
+            total=5,
+            connect=3,
+            read=3,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        return session
 
     def _test_connection(self) -> None:
         """Verify the API token is accepted by Palantir Foundry."""
         try:
-            response = requests.get(
+            response = self.session.get(
                 f"{self.base_url}/api/v2/admin/users",
                 headers=self.headers,
                 params={"pageSize": 1},
@@ -99,7 +119,7 @@ class PalantirFoundryClient:
         # urljoin requires the base to end with '/' and the path to have no leading '/'
         url = self.base_url.rstrip("/") + "/" + endpoint.lstrip("/")
         try:
-            response = requests.request(
+            response = self.session.request(
                 method,
                 url,
                 headers=self.headers,
@@ -459,11 +479,12 @@ def build_oaa_payload(
         log.debug("Added project: %s (%s)", name, rid)
 
     # ── Datasets (sub-resources of their parent Project) ──────────────────────
-    # Datasets are modelled as sub-resources of their parent Project.  They inherit
-    # all permissions granted on the Project (permission inheritance block).
+    # Datasets are modelled only as sub-resources of their parent Project.
+    # If no parent Project can be resolved, the dataset is skipped to preserve
+    # the strict permission path: User -> Group -> Project -> Sub-resource inheritance.
     log.info("Processing datasets as sub-resources of their parent project...")
     dataset_sub_count = 0
-    dataset_orphan_count = 0
+    dataset_skipped_count = 0
     for dataset in foundry_data.get("datasets", []):
         rid = dataset.get("rid") or dataset.get("id")
         if not rid:
@@ -483,23 +504,26 @@ def build_oaa_payload(
             resource_lookup[rid] = sub_resource
             dataset_sub_count += 1
         else:
-            # Parent project not found — fall back to top-level resource
-            resource = app.add_resource(resource_id=rid, resource_name=name, resource_type="Dataset")
-            resource_lookup[rid] = resource
-            dataset_orphan_count += 1
-            log.debug("Dataset %s has no parent project (projectRid=%s)", rid, project_rid)
+            dataset_skipped_count += 1
+            log.debug(
+                "Skipping dataset %s because no parent project was found (projectRid=%s)",
+                rid,
+                project_rid,
+            )
         log.debug("Added dataset: %s (%s)", name, rid)
     log.info(
-        "Processed %d datasets: %d as sub-resources, %d as top-level (no parent project found)",
-        dataset_sub_count + dataset_orphan_count, dataset_sub_count, dataset_orphan_count,
+        "Processed %d datasets: %d as sub-resources, %d skipped (no parent project found)",
+        dataset_sub_count + dataset_skipped_count,
+        dataset_sub_count,
+        dataset_skipped_count,
     )
 
     # ── Files / other resources (sub-resources of their parent Project) ───────
-    # Non-dataset files are modelled as sub-resources of their parent Project,
-    # inheriting permissions from the Project (permission inheritance block).
+    # Non-dataset files are modelled only as sub-resources of their parent Project.
+    # If no parent Project can be resolved, the file/resource is skipped.
     log.info("Processing files/resources as sub-resources of their parent project...")
     file_sub_count = 0
-    file_orphan_count = 0
+    file_skipped_count = 0
     for res in foundry_data.get("resources", []):
         rid = res.get("rid") or res.get("id")
         if not rid:
@@ -520,14 +544,18 @@ def build_oaa_payload(
             resource_lookup[rid] = sub_resource
             file_sub_count += 1
         else:
-            # Parent project not found — fall back to top-level resource
-            resource = app.add_resource(resource_id=rid, resource_name=name, resource_type=rtype)
-            resource_lookup[rid] = resource
-            file_orphan_count += 1
+            file_skipped_count += 1
+            log.debug(
+                "Skipping file/resource %s because no parent project was found (projectRid=%s)",
+                rid,
+                project_rid,
+            )
         log.debug("Added file/resource: %s (%s)", name, rid)
     log.info(
-        "Processed %d files/resources: %d as sub-resources, %d as top-level (no parent project found)",
-        file_sub_count + file_orphan_count, file_sub_count, file_orphan_count,
+        "Processed %d files/resources: %d as sub-resources, %d skipped (no parent project found)",
+        file_sub_count + file_skipped_count,
+        file_sub_count,
+        file_skipped_count,
     )
 
     # ── Access policies ───────────────────────────────────────────────────────
@@ -545,7 +573,17 @@ def build_oaa_payload(
     log.info("Processing access policies (group-based grants on projects only)...")
     total_permissions = 0
     skipped_direct_user_grants = 0
+    skipped_non_project_grants = 0
+    project_resource_ids = {
+        p.get("rid") or p.get("id")
+        for p in foundry_data.get("projects", [])
+        if (p.get("rid") or p.get("id"))
+    }
     for resource_id, policies in foundry_data.get("access_policies", {}).items():
+        if resource_id not in project_resource_ids:
+            # Enforce project-centric permission model.
+            skipped_non_project_grants += len(policies)
+            continue
         oaa_resource = resource_lookup.get(resource_id)
         if oaa_resource is None:
             continue
@@ -587,13 +625,20 @@ def build_oaa_payload(
             "Skipped %d direct user permission grant(s) — access flows via group membership",
             skipped_direct_user_grants,
         )
+    if skipped_non_project_grants:
+        log.info(
+            "Skipped %d non-project grant(s) — permissions are modelled only on Projects",
+            skipped_non_project_grants,
+        )
 
     log.info(
         "Payload: %d projects (resources), %d datasets (%d sub-resources), "
         "%d files (%d sub-resources), %d users, %d groups, %d memberships, %d permissions",
         len(foundry_data.get("projects", [])),
-        dataset_sub_count + dataset_orphan_count, dataset_sub_count,
-        file_sub_count + file_orphan_count, file_sub_count,
+        dataset_sub_count + dataset_skipped_count,
+        dataset_sub_count,
+        file_sub_count + file_skipped_count,
+        file_sub_count,
         len(user_lookup),
         len(group_lookup),
         membership_count,
@@ -728,11 +773,11 @@ def main() -> None:
                 group_memberships.append({"group_id": gid, **member})
     log.info("Retrieved %d group membership entries", len(group_memberships))
 
-    # Fetch access policies for projects, datasets, and files (not workspaces —
-    # workspaces are discovery containers only, not modelled as resources)
+    # Fetch access policies for projects only.
+    # Datasets/files inherit from Project via sub-resource inheritance.
     print("[3/5] Fetching access policies...")
     access_policies: Dict[str, List] = {}
-    for entity in projects + datasets + resources:
+    for entity in projects:
         rid = entity.get("rid") or entity.get("id")
         if rid:
             policies = foundry.get_access_policies(rid)

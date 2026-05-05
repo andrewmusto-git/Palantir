@@ -105,7 +105,7 @@ print_header "Step 5: Checking Installed Packages"
 print_info "Checking for required packages..."
 echo
 
-pip list | grep -E "python-dotenv|requests|oaaclient" || print_warning "Some packages may be missing"
+pip list | grep -E "python-dotenv|requests|urllib3|oaaclient" || print_warning "Some packages may be missing"
 echo
 
 # Step 6: Specific check for dotenv
@@ -145,6 +145,7 @@ packages = [
     ('typing', 'typing'),
     ('urllib.parse', 'urllib.parse'),
     ('requests', 'requests'),
+    ('urllib3', 'urllib3'),
     ('dotenv', 'python-dotenv'),
     ('oaaclient', 'oaaclient'),
 ]
