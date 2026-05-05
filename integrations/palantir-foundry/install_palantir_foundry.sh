@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # install_palantir_foundry.sh — One-command installer for Palantir Foundry–Veza OAA integration
-set -uo pipefail
+set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -23,6 +23,14 @@ ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 die()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
+_require_flag_value() {
+    local flag="$1"
+    local value="${2:-}"
+    if [[ -z "${value}" ]] || [[ "${value}" == --* ]]; then
+        die "${flag} requires a value"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -30,9 +38,23 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --non-interactive)  NON_INTERACTIVE=true ;;
         --overwrite-env)    OVERWRITE_ENV=true ;;
-        --install-dir)      INSTALL_DIR="$2"; SCRIPTS_DIR="${INSTALL_DIR}/scripts"; LOGS_DIR="${INSTALL_DIR}/logs"; shift ;;
-        --repo-url)         REPO_URL="$2"; shift ;;
-        --branch)           BRANCH="$2"; shift ;;
+        --install-dir)
+            _require_flag_value "$1" "${2:-}"
+            INSTALL_DIR="$2"
+            SCRIPTS_DIR="${INSTALL_DIR}/scripts"
+            LOGS_DIR="${INSTALL_DIR}/logs"
+            shift
+            ;;
+        --repo-url)
+            _require_flag_value "$1" "${2:-}"
+            REPO_URL="$2"
+            shift
+            ;;
+        --branch)
+            _require_flag_value "$1" "${2:-}"
+            BRANCH="$2"
+            shift
+            ;;
         *) die "Unknown flag: $1" ;;
     esac
     shift
@@ -60,14 +82,25 @@ fi
 
 _install_pkg() {
     local pkg="$1"
+    local install_prefix=""
+
     if [[ -z "${PKG_MGR}" ]]; then
         warn "Cannot install ${pkg} — no package manager detected."
         return
     fi
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        if command -v sudo &>/dev/null; then
+            install_prefix="sudo"
+        else
+            die "Installing ${pkg} requires root or sudo"
+        fi
+    fi
+
     info "Installing ${pkg}..."
     case "${PKG_MGR}" in
-        dnf|yum) "${PKG_MGR}" install -y "${pkg}" >/dev/null ;;
-        apt-get) apt-get install -y "${pkg}" >/dev/null ;;
+        dnf|yum) ${install_prefix} "${PKG_MGR}" install -y "${pkg}" >/dev/null ;;
+        apt-get) ${install_prefix} apt-get install -y "${pkg}" >/dev/null ;;
     esac
 }
 
@@ -113,7 +146,9 @@ ok "Python ${PYTHON_VERSION} detected"
 # Create directory layout
 # ---------------------------------------------------------------------------
 info "Creating installation directories..."
-mkdir -p "${SCRIPTS_DIR}" "${LOGS_DIR}"
+if ! mkdir -p "${SCRIPTS_DIR}" "${LOGS_DIR}"; then
+    die "Failed to create ${INSTALL_DIR}; use a writable --install-dir or run with elevated privileges"
+fi
 ok "Directories created at ${INSTALL_DIR}"
 
 # ---------------------------------------------------------------------------
@@ -124,7 +159,7 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf "${tmp_dir}"' EXIT
 
 GIT_TERMINAL_PROMPT=0 git clone --branch "${BRANCH}" --depth 1 --single-branch \
-    "${REPO_URL}" "${tmp_dir}" 2>/dev/null || die "git clone failed — check REPO_URL and BRANCH"
+    "${REPO_URL}" "${tmp_dir}" || die "git clone failed — check REPO_URL and BRANCH"
 
 if [[ ! -d "${tmp_dir}/${INTEGRATION_SUBDIR}" ]]; then
     die "Integration directory '${INTEGRATION_SUBDIR}' not found in repo"
